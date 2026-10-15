@@ -1,0 +1,6 @@
+{
+  "name": "dot — Mission Control Dashboard",
+  "description": "Truthful execution, attention, and milestone verification command center for dot with a documented local integration contract.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
