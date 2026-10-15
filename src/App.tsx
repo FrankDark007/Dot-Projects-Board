@@ -5,22 +5,37 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  Activity,
   AlertTriangle,
   Archive,
+  Calendar,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
+  Cpu,
   Database,
+  FileCode2,
+  LayoutGrid,
+  List,
+  Menu,
+  Moon,
   RefreshCw,
   Search,
+  ShieldAlert,
   Sliders,
+  Sun,
   Undo2,
+  Wifi,
   WifiOff,
+  X,
   XCircle,
 } from 'lucide-react';
 import {
   DashboardMode,
   DEFAULT_LIVE_CONFIG,
-  fetchLiveSnapshot,
+  executeLiveCommand,
   LiveAdapterConfig,
+  LivePollCoordinator,
   MissionControlDataController,
 } from './adapters/dataAdapter';
 import { AdapterConfigModal } from './components/AdapterConfigModal';
@@ -28,23 +43,30 @@ import { AttentionPanel } from './components/AttentionPanel';
 import { ContractAndTestsView } from './components/ContractAndTestsView';
 import { ProjectCard } from './components/ProjectCard';
 import { ProjectDetailModal } from './components/ProjectDetailModal';
+import { ProjectRow } from './components/ProjectRow';
+import { TodayView } from './components/TodayView';
 import { WorkersAndRunsView } from './components/WorkersAndRunsView';
 import { evaluateAllProjects, ProjectOverviewBucket } from './engine/stateEvaluator';
-import { createSyntheticSnapshot, REFERENCE_NOW_ISO } from './fixtures/syntheticFixtures';
+import { REFERENCE_NOW_ISO } from './fixtures/syntheticFixtures';
 import {
+  BackendCapabilities,
   ConnectionHealthState,
   CONTRACT_SCHEMA_VERSION,
   MissionControlSnapshot,
+  OperatorCommandRequest,
   PriorityLevel,
 } from './schema/contract';
-import { formatRelativeAge, formatUtcShort } from './utils/timeFormat';
+import { evaluateTimestamp, formatRelativeAge, formatUtcShort } from './utils/timeFormat';
 
 type NavSection =
-  | 'command_center'
+  | 'board_overview'
+  | 'today_focus'
   | 'attention_queue'
   | 'workers_runs'
-  | 'contract_tests'
-  | 'archived';
+  | 'archived'
+  | 'contract_tests';
+
+type ProjectDisplayLayout = 'rows' | 'cards';
 
 interface ActionFeedbackBanner {
   id: string;
@@ -55,40 +77,85 @@ interface ActionFeedbackBanner {
 }
 
 export default function App() {
-  const controllerRef = useRef<MissionControlDataController>(
+  // Demo controller is strictly isolated to Demo Mode
+  const demoControllerRef = useRef<MissionControlDataController>(
     new MissionControlDataController()
   );
 
+  // Live poll coordinator prevents overlapping requests and ignores late responses from old modes/endpoints
+  const liveCoordinatorRef = useRef<LivePollCoordinator>(new LivePollCoordinator());
+
+  const [theme, setTheme] = useState<'light' | 'dark'>('light');
   const [mode, setMode] = useState<DashboardMode>('demo');
   const [liveConfig, setLiveConfig] = useState<LiveAdapterConfig>(DEFAULT_LIVE_CONFIG);
-  const [demoSnapshot, setDemoSnapshot] = useState<MissionControlSnapshot>(() =>
-    controllerRef.current.getSnapshot()
-  );
 
-  // Live mode state (strictly separate from Demo data; never silently falls back to Demo)
+  // Demo state
+  const [demoSnapshot, setDemoSnapshot] = useState<MissionControlSnapshot>(() =>
+    demoControllerRef.current.getSnapshot()
+  );
+  const [demoClockOffsetSeconds, setDemoClockOffsetSeconds] = useState<number>(0);
+  const [capabilitiesReadOnlySimulated, setCapabilitiesReadOnlySimulated] =
+    useState<boolean>(false);
+
+  // Live state (strictly separate from Demo state; never receives synthetic fixtures)
   const [liveSnapshot, setLiveSnapshot] = useState<MissionControlSnapshot | null>(null);
   const [liveConnectionHealth, setLiveConnectionHealth] =
-    useState<ConnectionHealthState>('not_connected');
-  const [liveError, setLiveError] = useState<string | null>(null);
+    useState<ConnectionHealthState>('never_connected');
+  const [liveWarningOrError, setLiveWarningOrError] = useState<string | null>(null);
   const [liveLastSyncedAt, setLiveLastSyncedAt] = useState<string | null>(null);
-  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
-  const [isBackgroundTab, setIsBackgroundTab] = useState(false);
+  const [consecutiveFailures, setConsecutiveFailures] = useState<number>(0);
+  const [isPollingLive, setIsPollingLive] = useState<boolean>(false);
+  const [isBackgroundTab, setIsBackgroundTab] = useState<boolean>(false);
 
-  // Diagnostic simulation flags for verifying contract behavior
-  const [capabilitiesReadOnlySimulated, setCapabilitiesReadOnlySimulated] = useState(false);
-  const [staleLiveSimulated, setStaleLiveSimulated] = useState(false);
+  // Real advancing clock for Live Mode (updates every 1000ms so heartbeat expiry and stale warnings update without a new snapshot)
+  const [liveNowIso, setLiveNowIso] = useState<string>(() => new Date().toISOString());
 
-  // Navigation, filtering & selection state
-  const [activeNav, setActiveNav] = useState<NavSection>('command_center');
+  // Navigation, layout & filter state
+  const [activeNav, setActiveNav] = useState<NavSection>('board_overview');
+  const [displayLayout, setDisplayLayout] = useState<ProjectDisplayLayout>('rows');
   const [selectedBucket, setSelectedBucket] = useState<'all' | ProjectOverviewBucket>('all');
   const [ownerFilter, setOwnerFilter] = useState<string>('all');
   const [priorityFilter, setPriorityFilter] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-  const [adapterModalOpen, setAdapterModalOpen] = useState(false);
+  const [adapterModalOpen, setAdapterModalOpen] = useState<boolean>(false);
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState<boolean>(false);
+  const [diagnosticsExpanded, setDiagnosticsExpanded] = useState<boolean>(false);
   const [feedbackBanner, setFeedbackBanner] = useState<ActionFeedbackBanner | null>(null);
 
-  const referenceNowIso = REFERENCE_NOW_ISO;
+  // Sync dark mode class on documentElement
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === 'dark') {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+  }, [theme]);
+
+  // Advancing real-time clock in Live Mode with proper timer cleanup
+  useEffect(() => {
+    if (mode !== 'live') return;
+    setLiveNowIso(new Date().toISOString());
+    const intervalId = window.setInterval(() => {
+      setLiveNowIso(new Date().toISOString());
+    }, 1000);
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [mode]);
+
+  // Compute current evaluation reference timestamp:
+  // - In Demo Mode: deterministic REFERENCE_NOW_ISO + demoClockOffsetSeconds
+  // - In Live Mode: advancing real-time clock `liveNowIso`
+  const referenceNowIso = useMemo(() => {
+    if (mode === 'demo') {
+      return new Date(
+        Date.parse(REFERENCE_NOW_ISO) + demoClockOffsetSeconds * 1000
+      ).toISOString();
+    }
+    return liveNowIso;
+  }, [mode, demoClockOffsetSeconds, liveNowIso]);
 
   // Track background tab visibility for bounded polling throttling
   useEffect(() => {
@@ -99,32 +166,35 @@ export default function App() {
     return () => document.removeEventListener('visibilitychange', onVisibilityChange);
   }, []);
 
-  // Poll Live Adapter when in Live Mode
+  // Execute a bounded poll cycle via LivePollCoordinator
   const performLivePoll = useCallback(async () => {
-    try {
-      const snap = await fetchLiveSnapshot(liveConfig);
-      setLiveSnapshot(snap);
-      setLiveConnectionHealth('connected');
-      setLiveLastSyncedAt(new Date().toISOString());
-      setLiveError(null);
-      setConsecutiveFailures(0);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setLiveError(msg);
-      setConsecutiveFailures((prev) => prev + 1);
-      setLiveConnectionHealth((prevHealth) =>
-        prevHealth === 'connected' || prevHealth === 'degraded_stale' || liveSnapshot !== null
-          ? 'degraded_stale'
-          : 'not_connected'
-      );
+    if (liveCoordinatorRef.current.isInFlight()) return;
+    setIsPollingLive(true);
+    const nowForValidation = new Date().toISOString();
+    const outcome = await liveCoordinatorRef.current.pollOnce(liveConfig, {
+      referenceNowIso: nowForValidation,
+    });
+    setIsPollingLive(false);
+
+    if (outcome.status === 'ignored_stale_generation' || outcome.status === 'skipped_in_flight') {
+      return;
     }
-  }, [liveConfig, liveSnapshot]);
 
+    setLiveSnapshot(outcome.snapshot);
+    setLiveConnectionHealth(outcome.connectionHealth);
+    setLiveWarningOrError(outcome.warningOrError);
+
+    if (outcome.status === 'updated') {
+      setLiveLastSyncedAt(new Date().toISOString());
+      setConsecutiveFailures(0);
+    } else {
+      setConsecutiveFailures((prev) => prev + 1);
+    }
+  }, [liveConfig]);
+
+  // Scheduled bounded polling in Live Mode with exponential backoff and background-tab throttling
   useEffect(() => {
-    if (mode !== 'live' || staleLiveSimulated) return;
-
-    let cancelled = false;
-    const controller = new AbortController();
+    if (mode !== 'live') return;
 
     const backoffMultiplier = Math.pow(1.5, Math.min(consecutiveFailures, 5));
     const tabMultiplier = isBackgroundTab ? liveConfig.backgroundTabMultiplier : 1;
@@ -133,34 +203,58 @@ export default function App() {
       Math.round(liveConfig.basePollIntervalMs * backoffMultiplier * tabMultiplier)
     );
 
-    const timer = window.setTimeout(() => {
-      if (!cancelled) {
-        void performLivePoll();
-      }
+    const timerId = window.setTimeout(() => {
+      void performLivePoll();
     }, delayMs);
 
     return () => {
-      cancelled = true;
-      controller.abort();
-      window.clearTimeout(timer);
+      window.clearTimeout(timerId);
     };
-  }, [
-    mode,
-    staleLiveSimulated,
-    consecutiveFailures,
-    isBackgroundTab,
-    liveConfig,
-    performLivePoll,
-  ]);
+  }, [mode, consecutiveFailures, isBackgroundTab, liveConfig, performLivePoll]);
 
-  // Determine effective connection health and active snapshot (never substituting demo data in live mode unless stale simulation is explicitly toggled)
-  const effectiveConnectionHealth: ConnectionHealthState =
-    mode === 'demo' ? 'demo_synthetic' : liveConnectionHealth;
+  // Switch between Demo and Live modes cleanly (clearing incompatible selections & cancelling in-flight polls)
+  const handleSwitchMode = useCallback(
+    (nextMode: DashboardMode) => {
+      liveCoordinatorRef.current.invalidateAndReset(true);
+      setIsPollingLive(false);
+      setSelectedProjectId(null);
+      setFeedbackBanner(null);
+
+      if (nextMode === 'live') {
+        setLiveSnapshot(null);
+        setLiveConnectionHealth('never_connected');
+        setLiveWarningOrError(null);
+        setLiveLastSyncedAt(null);
+        setConsecutiveFailures(0);
+        setLiveNowIso(new Date().toISOString());
+        setMode('live');
+        void performLivePoll();
+      } else {
+        setMode('demo');
+      }
+    },
+    [performLivePoll]
+  );
+
+  // Determine effective connection health, including dynamic stale-feed detection without a new snapshot
+  const effectiveConnectionHealth: ConnectionHealthState = useMemo(() => {
+    if (mode === 'demo') return 'demo_synthetic';
+    if (liveConnectionHealth === 'connected' && liveLastSyncedAt) {
+      const syncAge = evaluateTimestamp(liveLastSyncedAt, referenceNowIso);
+      const staleLimitSec =
+        liveSnapshot?.evaluationThresholds.staleFeedWarningSeconds ??
+        Math.max(25, Math.ceil((liveConfig.basePollIntervalMs * 2.5) / 1000));
+      if (!syncAge.valid || (syncAge.ageSeconds !== null && syncAge.ageSeconds > staleLimitSec)) {
+        return 'stale';
+      }
+    }
+    return liveConnectionHealth;
+  }, [mode, liveConnectionHealth, liveLastSyncedAt, referenceNowIso, liveSnapshot, liveConfig]);
 
   const activeSnapshot: MissionControlSnapshot | null =
     mode === 'demo' ? demoSnapshot : liveSnapshot;
 
-  // Evaluate all projects in the active snapshot
+  // Evaluate all projects against `referenceNowIso`
   const allEvaluatedProjects = useMemo(() => {
     if (!activeSnapshot) return [];
     return evaluateAllProjects(activeSnapshot, referenceNowIso);
@@ -176,7 +270,7 @@ export default function App() {
     [allEvaluatedProjects]
   );
 
-  // Compute truthful Overview KPI bucket counts (across non-archived projects)
+  // Compute bucket counts across non-archived projects
   const bucketCounts = useMemo(() => {
     const counts: Record<ProjectOverviewBucket, number> = {
       working_now: 0,
@@ -193,13 +287,12 @@ export default function App() {
     return counts;
   }, [activeUnarchivedProjects]);
 
-  // Unique owners for filter
   const uniqueOwners = useMemo(() => {
     if (!activeSnapshot) return [];
     return Array.from(new Set(activeSnapshot.projects.map((p) => p.owner)));
   }, [activeSnapshot]);
 
-  // Filter projects according to active view, bucket, owner, priority, and search query
+  // Filter projects for current view
   const filteredProjects = useMemo(() => {
     const sourceList =
       activeNav === 'archived' ? archivedProjects : activeUnarchivedProjects;
@@ -249,8 +342,38 @@ export default function App() {
     searchQuery,
   ]);
 
-  // Effective capabilities (disabled when Live Mode is not connected or when simulated read-only is active)
-  const effectiveCapabilities = useMemo(() => {
+  // Group filtered projects into clear operational hierarchy for the Board Overview:
+  // 1) Attention / Blocked Needed First
+  // 2) Current Work (Confirmed Running) Second
+  // 3) Unfinished Backlog & Verified Complete Third
+  const hierarchySections = useMemo(() => {
+    const attentionOrBlocked = filteredProjects.filter(
+      (ep) => ep.buckets.includes('waiting_for_me') || ep.buckets.includes('blocked')
+    );
+    const attentionIds = new Set(attentionOrBlocked.map((ep) => ep.project.projectId));
+
+    const currentWork = filteredProjects.filter(
+      (ep) =>
+        !attentionIds.has(ep.project.projectId) && ep.buckets.includes('working_now')
+    );
+    const currentWorkIds = new Set(currentWork.map((ep) => ep.project.projectId));
+
+    const backlogAndCompleted = filteredProjects.filter(
+      (ep) =>
+        !attentionIds.has(ep.project.projectId) &&
+        !currentWorkIds.has(ep.project.projectId)
+    );
+
+    return {
+      attentionOrBlocked,
+      currentWork,
+      backlogAndCompleted,
+    };
+  }, [filteredProjects]);
+
+  // Effective capabilities:
+  // In Live Mode, controls are strictly read-only unless `liveConfig.enableLiveCommandRoute` AND `activeSnapshot.capabilities.commandEndpointVerified` are true
+  const effectiveCapabilities: BackendCapabilities = useMemo(() => {
     if (!activeSnapshot) {
       return {
         canArchive: false,
@@ -261,57 +384,144 @@ export default function App() {
         reasonIfDisabled: 'Live adapter is not connected.',
       };
     }
-    if (mode === 'live' && effectiveConnectionHealth !== 'connected') {
-      return {
-        canArchive: false,
-        canChangePriority: false,
-        canAddNote: false,
-        canSendReminder: false,
-        canResolveDecision: false,
-        reasonIfDisabled:
-          'Live feed is disconnected (showing stale data). Reconnect before issuing operator writes.',
-      };
-    }
-    return activeSnapshot.capabilities;
-  }, [activeSnapshot, mode, effectiveConnectionHealth]);
 
-  // Command Handlers (with Idempotency Keys, Optimistic Concurrency & Truthful Delivery Acks)
+    if (mode === 'live') {
+      if (effectiveConnectionHealth !== 'connected') {
+        return {
+          canArchive: false,
+          canChangePriority: false,
+          canAddNote: false,
+          canSendReminder: false,
+          canResolveDecision: false,
+          reasonIfDisabled:
+            'Live feed is stale or disconnected. Reconnect before issuing operator commands.',
+        };
+      }
+      if (
+        !liveConfig.enableLiveCommandRoute ||
+        !activeSnapshot.capabilities.commandEndpointVerified
+      ) {
+        return {
+          canArchive: false,
+          canChangePriority: false,
+          canAddNote: false,
+          canSendReminder: false,
+          canResolveDecision: false,
+          reasonIfDisabled:
+            'Live Mode is read-only until a verified backend command endpoint (/commands) is configured in local Mission Control.',
+        };
+      }
+    }
+
+    return activeSnapshot.capabilities;
+  }, [activeSnapshot, mode, effectiveConnectionHealth, liveConfig.enableLiveCommandRoute]);
+
+  // Unified Command Dispatcher:
+  // - In Demo Mode: invokes `demoControllerRef.current.executeCommand` and updates `demoSnapshot`
+  // - In Live Mode: NEVER invokes `demoControllerRef` or mutates `demoSnapshot`; calls `executeLiveCommand`
+  const dispatchOperatorCommand = useCallback(
+    async (
+      req: OperatorCommandRequest,
+      onDemoSuccessMessage: (newRev?: number) => {
+        message: string;
+        undoProjectId?: string;
+        undoTargetArchiveState?: boolean;
+      }
+    ) => {
+      if (mode === 'live') {
+        const liveRes = await executeLiveCommand(
+          liveConfig,
+          activeSnapshot?.capabilities ?? null,
+          req
+        );
+        if (liveRes.ok) {
+          setFeedbackBanner({
+            id: liveRes.idempotencyKey,
+            tone: 'success',
+            message:
+              liveRes.deliveryAck?.outcome === 'accepted_pending_delivery'
+                ? 'Command accepted by backend; downstream delivery is still pending.'
+                : 'Live command acknowledged by backend. Refreshing snapshot...',
+          });
+          void performLivePoll();
+        } else {
+          setFeedbackBanner({
+            id: liveRes.idempotencyKey,
+            tone: liveRes.errorCode === 'UNCERTAIN_WRITE_TIMEOUT' ? 'warning' : 'danger',
+            message:
+              liveRes.errorMessage ||
+              'Live command rejected. Demo controller was not invoked.',
+          });
+        }
+        return;
+      }
+
+      // Demo Mode execution
+      const res = demoControllerRef.current.executeCommand(req);
+      setDemoSnapshot(demoControllerRef.current.getSnapshot());
+
+      if (res.ok) {
+        if (req.command.type === 'send_reminder') {
+          if (res.deliveryAck?.outcome === 'delivered_acknowledged') {
+            setFeedbackBanner({
+              id: res.idempotencyKey,
+              tone: 'success',
+              message: `[Demo Simulation] Reminder acknowledged by ${res.deliveryAck.recipient} via ${res.deliveryAck.channel} (Ack: ${res.deliveryAck.ackId}).`,
+            });
+          } else {
+            setFeedbackBanner({
+              id: res.idempotencyKey,
+              tone: 'warning',
+              message: `[Demo Simulation] Command accepted, but delivery to ${req.command.targetOwner} is still pending acknowledgment.`,
+            });
+          }
+          return;
+        }
+
+        const info = onDemoSuccessMessage(res.newRevision);
+        setFeedbackBanner({
+          id: res.idempotencyKey,
+          tone: 'success',
+          message: info.message,
+          undoProjectId: info.undoProjectId,
+          undoTargetArchiveState: info.undoTargetArchiveState,
+        });
+      } else {
+        setFeedbackBanner({
+          id: res.idempotencyKey,
+          tone: res.errorCode === 'UNCERTAIN_WRITE_TIMEOUT' ? 'warning' : 'danger',
+          message: res.errorMessage || 'Command failed.',
+        });
+      }
+    },
+    [mode, liveConfig, activeSnapshot, performLivePoll]
+  );
+
   const handleToggleArchive = (projectId: string, archive: boolean) => {
     if (!activeSnapshot) return;
     const proj = activeSnapshot.projects.find((p) => p.projectId === projectId);
     if (!proj) return;
 
-    const res = controllerRef.current.executeCommand({
-      schemaVersion: CONTRACT_SCHEMA_VERSION,
-      idempotencyKey: `ui-archive-${projectId}-r${proj.revision}-${archive ? '1' : '0'}`,
-      expectedRevision: proj.revision,
-      issuedAt: new Date().toISOString(),
-      command: {
-        type: 'archive_project',
-        projectId,
-        archive,
+    void dispatchOperatorCommand(
+      {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        idempotencyKey: `cmd-archive-${projectId}-r${proj.revision}-${archive ? '1' : '0'}`,
+        expectedRevision: proj.revision,
+        issuedAt: referenceNowIso,
+        command: {
+          type: 'archive_project',
+          projectId,
+          archive,
+        },
       },
-    });
-
-    setDemoSnapshot(controllerRef.current.getSnapshot());
-
-    if (res.ok) {
-      setFeedbackBanner({
-        id: res.idempotencyKey,
-        tone: 'success',
+      () => ({
         message: archive
-          ? `Archived "${proj.name}". Zero files deleted and zero running jobs cancelled.`
+          ? `Archived "${proj.name}" in demo state (files & running workers untouched).`
           : `Restored "${proj.name}" from archive.`,
         undoProjectId: projectId,
         undoTargetArchiveState: !archive,
-      });
-    } else {
-      setFeedbackBanner({
-        id: res.idempotencyKey,
-        tone: 'danger',
-        message: res.errorMessage || 'Failed to update archive state.',
-      });
-    }
+      })
+    );
   };
 
   const handleChangePriority = (projectId: string, priority: PriorityLevel) => {
@@ -319,32 +529,22 @@ export default function App() {
     const proj = activeSnapshot.projects.find((p) => p.projectId === projectId);
     if (!proj) return;
 
-    const res = controllerRef.current.executeCommand({
-      schemaVersion: CONTRACT_SCHEMA_VERSION,
-      idempotencyKey: `ui-prio-${projectId}-r${proj.revision}-${priority}`,
-      expectedRevision: proj.revision,
-      issuedAt: new Date().toISOString(),
-      command: {
-        type: 'set_priority',
-        projectId,
-        priority,
+    void dispatchOperatorCommand(
+      {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        idempotencyKey: `cmd-prio-${projectId}-r${proj.revision}-${priority}`,
+        expectedRevision: proj.revision,
+        issuedAt: referenceNowIso,
+        command: {
+          type: 'set_priority',
+          projectId,
+          priority,
+        },
       },
-    });
-
-    setDemoSnapshot(controllerRef.current.getSnapshot());
-    if (res.ok) {
-      setFeedbackBanner({
-        id: res.idempotencyKey,
-        tone: 'success',
-        message: `Updated "${proj.name}" priority to ${priority.toUpperCase()} (revision v${res.newRevision}).`,
-      });
-    } else {
-      setFeedbackBanner({
-        id: res.idempotencyKey,
-        tone: 'danger',
-        message: res.errorMessage || 'Priority update rejected.',
-      });
-    }
+      (newRev) => ({
+        message: `Updated "${proj.name}" priority to ${priority.toUpperCase()} (rev v${newRev}).`,
+      })
+    );
   };
 
   const handleAddNote = (projectId: string, body: string) => {
@@ -352,33 +552,23 @@ export default function App() {
     const proj = activeSnapshot.projects.find((p) => p.projectId === projectId);
     if (!proj) return;
 
-    const res = controllerRef.current.executeCommand({
-      schemaVersion: CONTRACT_SCHEMA_VERSION,
-      idempotencyKey: `ui-note-${projectId}-r${proj.revision}-${Date.now()}`,
-      expectedRevision: proj.revision,
-      issuedAt: new Date().toISOString(),
-      command: {
-        type: 'add_note',
-        projectId,
-        body,
-        author: 'you',
+    void dispatchOperatorCommand(
+      {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        idempotencyKey: `cmd-note-${projectId}-r${proj.revision}-${Date.now()}`,
+        expectedRevision: proj.revision,
+        issuedAt: referenceNowIso,
+        command: {
+          type: 'add_note',
+          projectId,
+          body,
+          author: 'you',
+        },
       },
-    });
-
-    setDemoSnapshot(controllerRef.current.getSnapshot());
-    if (res.ok) {
-      setFeedbackBanner({
-        id: res.idempotencyKey,
-        tone: 'success',
+      () => ({
         message: `Added operator note to "${proj.name}".`,
-      });
-    } else {
-      setFeedbackBanner({
-        id: res.idempotencyKey,
-        tone: 'danger',
-        message: res.errorMessage || 'Could not add note.',
-      });
-    }
+      })
+    );
   };
 
   const handleSendReminder = (
@@ -390,36 +580,23 @@ export default function App() {
     const proj = activeSnapshot.projects.find((p) => p.projectId === projectId);
     if (!proj) return;
 
-    const res = controllerRef.current.executeCommand({
-      schemaVersion: CONTRACT_SCHEMA_VERSION,
-      idempotencyKey: `ui-rem-${projectId}-r${proj.revision}-${Date.now()}`,
-      expectedRevision: proj.revision,
-      issuedAt: new Date().toISOString(),
-      command: {
-        type: 'send_reminder',
-        projectId,
-        targetOwner,
-        message,
+    void dispatchOperatorCommand(
+      {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        idempotencyKey: `cmd-rem-${projectId}-r${proj.revision}-${Date.now()}`,
+        expectedRevision: proj.revision,
+        issuedAt: referenceNowIso,
+        command: {
+          type: 'send_reminder',
+          projectId,
+          targetOwner,
+          message,
+        },
       },
-    });
-
-    setDemoSnapshot(controllerRef.current.getSnapshot());
-
-    if (res.ok && res.deliveryAck?.acknowledged) {
-      setFeedbackBanner({
-        id: res.idempotencyKey,
-        tone: 'success',
-        message: `Reminder delivered and acknowledged by ${targetOwner} via ${res.deliveryAck.channel} (Ack ID: ${res.deliveryAck.ackId}).`,
-      });
-    } else {
-      setFeedbackBanner({
-        id: res.idempotencyKey,
-        tone: 'danger',
-        message:
-          res.errorMessage ||
-          `Reminder delivery to ${targetOwner} was NOT acknowledged. Do not assume ${targetOwner} was notified.`,
-      });
-    }
+      () => ({
+        message: `Reminder processed for ${targetOwner}.`,
+      })
+    );
   };
 
   const handleResolveDecision = (
@@ -432,78 +609,52 @@ export default function App() {
     const proj = activeSnapshot.projects.find((p) => p.projectId === projectId);
     if (!proj) return;
 
-    const res = controllerRef.current.executeCommand({
-      schemaVersion: CONTRACT_SCHEMA_VERSION,
-      idempotencyKey: `ui-dec-${decisionId}-r${proj.revision}`,
-      expectedRevision: proj.revision,
-      issuedAt: new Date().toISOString(),
-      command: {
-        type: 'resolve_decision',
-        projectId,
-        decisionId,
-        selectedOption,
-        resolutionNote,
+    void dispatchOperatorCommand(
+      {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        idempotencyKey: `cmd-dec-${decisionId}-r${proj.revision}`,
+        expectedRevision: proj.revision,
+        issuedAt: referenceNowIso,
+        command: {
+          type: 'resolve_decision',
+          projectId,
+          decisionId,
+          selectedOption,
+          resolutionNote,
+        },
       },
-    });
-
-    setDemoSnapshot(controllerRef.current.getSnapshot());
-    if (res.ok) {
-      setFeedbackBanner({
-        id: res.idempotencyKey,
-        tone: 'success',
-        message: `Recorded decision for ${decisionId} (revision v${res.newRevision}).`,
-      });
-    } else {
-      setFeedbackBanner({
-        id: res.idempotencyKey,
-        tone: 'danger',
-        message: res.errorMessage || 'Could not resolve decision.',
-      });
-    }
+      (newRev) => ({
+        message: `Recorded decision for ${decisionId} (rev v${newRev}).`,
+      })
+    );
   };
 
   const handleToggleCapabilitiesReadOnly = (disabled: boolean) => {
+    if (mode !== 'demo') return;
     setCapabilitiesReadOnlySimulated(disabled);
-    controllerRef.current.setCapabilities({
+    demoControllerRef.current.setCapabilities({
       canArchive: !disabled,
       canChangePriority: !disabled,
       canAddNote: !disabled,
       canSendReminder: !disabled,
       canResolveDecision: !disabled,
       reasonIfDisabled: disabled
-        ? 'Backend mounted in read-only observer mode (writes disabled by capability flag).'
+        ? 'Simulated read-only observer mode in Demo (writes disabled by capability flag).'
         : undefined,
     });
-    setDemoSnapshot(controllerRef.current.getSnapshot());
-  };
-
-  const handleToggleSimulateStaleLive = (stale: boolean) => {
-    setStaleLiveSimulated(stale);
-    if (stale) {
-      setMode('live');
-      setLiveSnapshot(createSyntheticSnapshot(REFERENCE_NOW_ISO));
-      setLiveConnectionHealth('degraded_stale');
-      setLiveLastSyncedAt(REFERENCE_NOW_ISO);
-      setLiveError(
-        'Connection lost to http://127.0.0.1:43110/api/mission-control/v1/snapshot (ECONNREFUSED). Preserving last-known snapshot.'
-      );
-    } else {
-      setLiveSnapshot(null);
-      setLiveConnectionHealth('not_connected');
-      setLiveError(null);
-    }
+    setDemoSnapshot(demoControllerRef.current.getSnapshot());
   };
 
   const handleResetDemoFixtures = () => {
-    controllerRef.current = new MissionControlDataController();
+    demoControllerRef.current = new MissionControlDataController();
     setCapabilitiesReadOnlySimulated(false);
-    setStaleLiveSimulated(false);
-    setDemoSnapshot(controllerRef.current.getSnapshot());
-    setMode('demo');
+    setDemoClockOffsetSeconds(0);
+    setDemoSnapshot(demoControllerRef.current.getSnapshot());
+    handleSwitchMode('demo');
     setFeedbackBanner({
       id: `reset-${Date.now()}`,
       tone: 'success',
-      message: 'Synthetic fixtures reset to baseline state.',
+      message: 'Synthetic demo fixtures and clock offset reset to baseline.',
     });
   };
 
@@ -518,40 +669,86 @@ export default function App() {
     return activeSnapshot.decisions.filter((d) => d.status === 'open').length;
   }, [activeSnapshot]);
 
+  const renderProjectCollection = (projectsToRender: typeof filteredProjects) => {
+    if (displayLayout === 'rows') {
+      return (
+        <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg overflow-hidden">
+          {projectsToRender.map((ep) => (
+            <ProjectRow
+              key={ep.project.projectId}
+              evaluated={ep}
+              referenceNowIso={referenceNowIso}
+              capabilities={effectiveCapabilities}
+              isSelected={selectedProjectId === ep.project.projectId}
+              onSelectProject={(id) => setSelectedProjectId(id)}
+              onChangePriority={handleChangePriority}
+              onToggleArchive={handleToggleArchive}
+              onSendReminder={handleSendReminder}
+            />
+          ))}
+        </div>
+      );
+    }
+
+    return (
+      <div className="space-y-4">
+        {projectsToRender.map((ep) => (
+          <ProjectCard
+            key={ep.project.projectId}
+            evaluated={ep}
+            referenceNowIso={referenceNowIso}
+            capabilities={effectiveCapabilities}
+            isSelected={selectedProjectId === ep.project.projectId}
+            onSelectProject={(id) => setSelectedProjectId(id)}
+            onChangePriority={handleChangePriority}
+            onToggleArchive={handleToggleArchive}
+            onSendReminder={handleSendReminder}
+          />
+        ))}
+      </div>
+    );
+  };
+
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
-      {/* 1. Persistent Truthfulness Mode Banner (DEMO DATA vs NOT CONNECTED vs STALE LIVE) */}
+    <div className="min-h-screen flex flex-col bg-slate-50 dark:bg-[#0B0F17] text-slate-900 dark:text-slate-100">
+      {/* 1. Persistent Mode & Connection Truthfulness Banner */}
       {mode === 'demo' && (
         <div
           role="region"
-          aria-label="Demo Data Mode Notice"
-          className="bg-slate-900 text-slate-100 px-4 sm:px-8 py-2.5 text-xs border-b border-slate-800"
+          aria-label="Synthetic Demo Data Notice"
+          className="bg-slate-900 dark:bg-slate-950 text-slate-100 px-4 py-2 text-xs border-b border-slate-800"
         >
-          <div className="max-w-[1400px] mx-auto flex flex-wrap items-center justify-between gap-3">
+          <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-2">
               <Database className="w-3.5 h-3.5 text-amber-400 shrink-0" />
               <span className="font-mono font-semibold tracking-wide text-amber-300">
-                DEMO DATA — SYNTHETIC FIXTURES
+                SYNTHETIC DEMO DATA
               </span>
               <span aria-hidden="true" className="text-slate-600">
                 ·
               </span>
               <span className="text-slate-300">
-                No access to your Macs, local repos, or MD workers from AI Studio. Showing
-                contract-compliant synthetic fixtures ({controllerRef.current.getDroppedDuplicatesCount()}{' '}
-                duplicate event automatically deduplicated).
+                Sanitized fixtures for evaluation ({demoControllerRef.current.getDroppedDuplicatesCount()}{' '}
+                duplicate event deduplicated). Not connected to local Macs or MD workers.
+                {demoClockOffsetSeconds > 0
+                  ? ` Clock advanced +${demoClockOffsetSeconds}s.`
+                  : ''}
               </span>
             </div>
             <div className="flex items-center gap-3 shrink-0">
               <button
                 type="button"
-                onClick={() => {
-                  setStaleLiveSimulated(false);
-                  setLiveSnapshot(null);
-                  setLiveConnectionHealth('not_connected');
-                  setMode('live');
-                  void performLivePoll();
-                }}
+                onClick={() => setDemoClockOffsetSeconds((s) => s + 120)}
+                className="text-slate-300 hover:text-white underline underline-offset-4 cursor-pointer"
+              >
+                Advance Demo Clock +2m
+              </button>
+              <span aria-hidden="true" className="text-slate-600">
+                ·
+              </span>
+              <button
+                type="button"
+                onClick={() => handleSwitchMode('live')}
                 className="font-medium text-amber-300 hover:text-white underline underline-offset-4 whitespace-nowrap cursor-pointer"
               >
                 Switch to Live Adapter Mode
@@ -561,13 +758,13 @@ export default function App() {
         </div>
       )}
 
-      {mode === 'live' && effectiveConnectionHealth === 'not_connected' && (
+      {mode === 'live' && effectiveConnectionHealth === 'never_connected' && (
         <div
           role="region"
           aria-label="Live Adapter Not Connected"
-          className="bg-red-950 text-red-100 px-4 sm:px-8 py-2.5 text-xs border-b border-red-900"
+          className="bg-red-950 text-red-100 px-4 py-2 text-xs border-b border-red-900"
         >
-          <div className="max-w-[1400px] mx-auto flex flex-wrap items-center justify-between gap-3">
+          <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-2">
               <WifiOff className="w-3.5 h-3.5 text-red-400 shrink-0" />
               <span className="font-mono font-semibold text-red-300">
@@ -577,13 +774,14 @@ export default function App() {
                 ·
               </span>
               <span>
-                Endpoint <code className="font-mono">{liveConfig.endpointBaseUrl}</code> is
-                unreachable. Demo data is never silently substituted for a failed live feed.
+                No valid snapshot received from{' '}
+                <code className="font-mono">{liveConfig.endpointBaseUrl}</code>. Synthetic
+                demo fixtures are never substituted for a failed live feed.
               </span>
             </div>
             <button
               type="button"
-              onClick={() => setMode('demo')}
+              onClick={() => handleSwitchMode('demo')}
               className="font-medium text-red-200 hover:text-white underline underline-offset-4 whitespace-nowrap cursor-pointer"
             >
               Return to Demo Fixtures
@@ -592,562 +790,756 @@ export default function App() {
         </div>
       )}
 
-      {mode === 'live' && effectiveConnectionHealth === 'degraded_stale' && (
-        <div
-          role="region"
-          aria-label="Stale Live Data Warning"
-          className="bg-amber-950 text-amber-100 px-4 sm:px-8 py-2.5 text-xs border-b border-amber-900"
-        >
-          <div className="max-w-[1400px] mx-auto flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2">
-              <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-              <span className="font-mono font-semibold text-amber-300">
-                STALE DATA — LIVE FEED DISCONNECTED
-              </span>
-              <span aria-hidden="true" className="text-amber-700">
-                ·
-              </span>
-              <span>
-                Preserving last-known snapshot from{' '}
-                <strong className="font-mono tabular-nums">
-                  {formatUtcShort(liveLastSyncedAt)}
-                </strong>
-                . Operator writes are disabled until connection recovers.
-              </span>
-            </div>
-            <button
-              type="button"
-              onClick={() => setAdapterModalOpen(true)}
-              className="font-medium text-amber-200 hover:text-white underline underline-offset-4 whitespace-nowrap cursor-pointer"
-            >
-              Inspect Connection Error
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* 2. Top Bar Contract: 3 Zones separated by gap-8 */}
-      <header className="bg-white border-b border-slate-200 px-4 sm:px-8 py-4">
-        <div className="max-w-[1400px] mx-auto flex items-center justify-between gap-8">
-          {/* Zone 1: Single text element Brand wordmark */}
-          <a
-            href="#top"
-            onClick={(e) => {
-              e.preventDefault();
-              setActiveNav('command_center');
-            }}
-            className="text-lg font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0"
-          >
-            dot · Mission Control
-          </a>
-
-          {/* Zone 2: 5 concise single-line text navigation links */}
-          <nav
-            aria-label="Primary Navigation"
-            className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600"
-          >
-            <button
-              type="button"
-              onClick={() => setActiveNav('command_center')}
-              className={`hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-0.5 ${
-                activeNav === 'command_center'
-                  ? 'text-slate-900 border-b-2 border-slate-900 font-semibold'
-                  : ''
-              }`}
-            >
-              Command Center
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveNav('attention_queue')}
-              className={`hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-0.5 ${
-                activeNav === 'attention_queue'
-                  ? 'text-slate-900 border-b-2 border-slate-900 font-semibold'
-                  : ''
-              }`}
-            >
-              Attention Queue ({openDecisionsCount})
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveNav('workers_runs')}
-              className={`hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-0.5 ${
-                activeNav === 'workers_runs'
-                  ? 'text-slate-900 border-b-2 border-slate-900 font-semibold'
-                  : ''
-              }`}
-            >
-              Workers & Runs
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveNav('contract_tests')}
-              className={`hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-0.5 ${
-                activeNav === 'contract_tests'
-                  ? 'text-slate-900 border-b-2 border-slate-900 font-semibold'
-                  : ''
-              }`}
-            >
-              Contract & Tests
-            </button>
-            <button
-              type="button"
-              onClick={() => setActiveNav('archived')}
-              className={`hover:text-slate-900 transition-colors whitespace-nowrap shrink-0 cursor-pointer pb-0.5 ${
-                activeNav === 'archived'
-                  ? 'text-slate-900 border-b-2 border-slate-900 font-semibold'
-                  : ''
-              }`}
-            >
-              Archived ({archivedProjects.length})
-            </button>
-          </nav>
-
-          {/* Zone 3: 1 primary action */}
-          <div className="flex items-center gap-3 shrink-0">
-            <button
-              type="button"
-              onClick={() => setAdapterModalOpen(true)}
-              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-            >
-              <Sliders className="w-3.5 h-3.5" />
-              <span>Configure Adapter</span>
-            </button>
-          </div>
-        </div>
-
-        {/* Mobile Navigation Bar */}
-        <div className="flex md:hidden items-center gap-2 overflow-x-auto pt-3 mt-3 border-t border-slate-100 text-xs">
-          {(
-            [
-              ['command_center', 'Command Center'],
-              ['attention_queue', `Attention (${openDecisionsCount})`],
-              ['workers_runs', 'Workers & Runs'],
-              ['contract_tests', 'Contract & Tests'],
-              ['archived', `Archived (${archivedProjects.length})`],
-            ] as const
-          ).map(([key, label]) => (
-            <button
-              key={key}
-              type="button"
-              onClick={() => setActiveNav(key)}
-              className={`px-3 py-1.5 rounded-md font-medium whitespace-nowrap shrink-0 ${
-                activeNav === key
-                  ? 'bg-slate-900 text-white'
-                  : 'bg-slate-100 text-slate-700'
-              }`}
-            >
-              {label}
-            </button>
-          ))}
-        </div>
-      </header>
-
-      {/* Main Content Container */}
-      <main className="flex-1 max-w-[1400px] w-full mx-auto px-4 sm:px-8 py-8">
-        {/* Operator Command Feedback / Undo Toast */}
-        {feedbackBanner && (
+      {mode === 'live' &&
+        (effectiveConnectionHealth === 'stale' ||
+          effectiveConnectionHealth === 'disconnected') && (
           <div
-            role="status"
-            className={`flex flex-wrap items-center justify-between gap-3 px-4 py-3 rounded-lg border mb-6 text-xs ${
-              feedbackBanner.tone === 'success'
-                ? 'bg-emerald-50 border-emerald-200 text-emerald-950'
-                : feedbackBanner.tone === 'danger'
-                ? 'bg-red-50 border-red-200 text-red-950'
-                : 'bg-amber-50 border-amber-200 text-amber-950'
-            }`}
+            role="region"
+            aria-label="Stale or Disconnected Live Feed Warning"
+            className="bg-amber-950 text-amber-100 px-4 py-2 text-xs border-b border-amber-900"
           >
-            <div className="flex items-center gap-2">
-              {feedbackBanner.tone === 'success' ? (
-                <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
-              ) : (
-                <XCircle className="w-4 h-4 text-red-700 shrink-0" />
-              )}
-              <span className="font-medium">{feedbackBanner.message}</span>
-            </div>
-            <div className="flex items-center gap-3">
-              {feedbackBanner.undoProjectId !== undefined &&
-                feedbackBanner.undoTargetArchiveState !== undefined && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      handleToggleArchive(
-                        feedbackBanner.undoProjectId!,
-                        feedbackBanner.undoTargetArchiveState!
-                      )
-                    }
-                    className="inline-flex items-center gap-1 font-semibold underline underline-offset-4 hover:text-slate-900 cursor-pointer"
-                  >
-                    <Undo2 className="w-3.5 h-3.5" />
-                    <span>Undo</span>
-                  </button>
-                )}
+            <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2">
+                <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <span className="font-mono font-semibold text-amber-300">
+                  {effectiveConnectionHealth === 'disconnected'
+                    ? 'LIVE FEED DISCONNECTED — SHOWING PRESERVED SNAPSHOT'
+                    : 'STALE LIVE FEED WARNING'}
+                </span>
+                <span aria-hidden="true" className="text-amber-700">
+                  ·
+                </span>
+                <span>
+                  Last valid sync:{' '}
+                  <strong className="font-mono tabular-nums">
+                    {formatRelativeAge(liveLastSyncedAt, referenceNowIso)}
+                  </strong>
+                  {liveWarningOrError ? ` (${liveWarningOrError})` : ''}.
+                </span>
+              </div>
               <button
                 type="button"
-                onClick={() => setFeedbackBanner(null)}
-                className="text-slate-500 hover:text-slate-900 cursor-pointer"
+                onClick={() => void performLivePoll()}
+                className="font-medium text-amber-200 hover:text-white underline underline-offset-4 whitespace-nowrap cursor-pointer"
               >
-                Dismiss
+                Retry Poll Now
               </button>
             </div>
           </div>
         )}
 
-        {/* LIVE MODE: NOT CONNECTED EMPTY STATE (No silent demo fallback!) */}
-        {mode === 'live' && !activeSnapshot ? (
-          <section className="bg-white border border-slate-300 rounded-xl p-10 text-center max-w-2xl mx-auto my-8">
-            <WifiOff className="w-10 h-10 text-red-700 mx-auto mb-3" />
-            <h1 className="text-xl font-bold text-slate-900 mb-2">
-              NOT CONNECTED TO LOCAL MISSION CONTROL
-            </h1>
-            <p className="text-sm text-slate-600 mb-4">
-              Live Mode is active, and no snapshot has been received from{' '}
-              <code className="font-mono text-xs bg-slate-100 px-1.5 py-0.5 rounded">
-                {liveConfig.endpointBaseUrl}/snapshot
-              </code>
-              . By contract, this dashboard never silently substitutes synthetic demo data when a
-              live feed fails or is disconnected.
-            </p>
-            {liveError && (
-              <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-xs font-mono text-red-800 mb-6 text-left">
-                Last connection error: {liveError} (Failed polls: {consecutiveFailures})
+      {/* 2. Workspace Shell: Compact Sidebar + Main Content Area */}
+      <div className="flex-1 flex max-w-[1600px] w-full mx-auto">
+        {/* Compact Left Sidebar (Desktop) */}
+        <aside
+          aria-label="Workspace Navigation"
+          className="hidden md:flex md:w-56 shrink-0 flex-col border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-3.5 justify-between"
+        >
+          <div className="space-y-5">
+            {/* Brand */}
+            <div className="px-2 pt-1">
+              <div className="text-sm font-bold tracking-tight text-slate-900 dark:text-white">
+                dot · Projects Board
+              </div>
+              <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 mt-0.5">
+                {mode === 'demo' ? 'Mode: Demo Fixtures' : `Mode: Live (${effectiveConnectionHealth})`}
+              </div>
+            </div>
+
+            {/* Primary Views */}
+            <nav aria-label="Primary Views" className="space-y-1 text-xs">
+              <div className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
+                Workspace
+              </div>
+              {(
+                [
+                  { id: 'board_overview', label: 'Board Overview', icon: List, badge: activeUnarchivedProjects.length },
+                  { id: 'today_focus', label: 'Today Focus', icon: Calendar, badge: undefined },
+                  { id: 'attention_queue', label: 'Attention Needed', icon: ShieldAlert, badge: openDecisionsCount },
+                  { id: 'workers_runs', label: 'Workers & Runs', icon: Cpu, badge: activeSnapshot?.workers.length },
+                  { id: 'archived', label: 'Archived', icon: Archive, badge: archivedProjects.length },
+                  { id: 'contract_tests', label: 'Contract & Tests', icon: FileCode2, badge: undefined },
+                ] as const
+              ).map((item) => {
+                const Icon = item.icon;
+                const isActive = activeNav === item.id;
+                return (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => setActiveNav(item.id)}
+                    className={`w-full flex items-center justify-between px-2.5 py-2 rounded-md font-medium transition-colors cursor-pointer ${
+                      isActive
+                        ? 'bg-slate-900 dark:bg-sky-600 text-white'
+                        : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800/70'
+                    }`}
+                  >
+                    <span className="inline-flex items-center gap-2 truncate">
+                      <Icon className="w-3.5 h-3.5 shrink-0" />
+                      <span className="truncate">{item.label}</span>
+                    </span>
+                    {item.badge !== undefined && (
+                      <span
+                        className={`font-mono text-[11px] tabular-nums ${
+                          isActive
+                            ? 'text-slate-200 dark:text-sky-100'
+                            : 'text-slate-400 dark:text-slate-500'
+                        }`}
+                      >
+                        {item.badge}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </nav>
+
+            {/* Quick Status Filters */}
+            {activeSnapshot && (
+              <div className="space-y-1 text-xs pt-3 border-t border-slate-200 dark:border-slate-800">
+                <div className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
+                  Status Filters
+                </div>
+                {(
+                  [
+                    ['all', 'All Active', activeUnarchivedProjects.length],
+                    ['working_now', 'Running', bucketCounts.working_now],
+                    ['waiting_for_me', 'Needs Me', bucketCounts.waiting_for_me],
+                    ['blocked', 'Blocked', bucketCounts.blocked],
+                    ['unfinished', 'Unfinished', bucketCounts.unfinished],
+                    ['recently_verified_complete', 'Completed', bucketCounts.recently_verified_complete],
+                  ] as const
+                ).map(([bKey, bLabel, bCount]) => {
+                  const isSelected =
+                    activeNav === 'board_overview' && selectedBucket === bKey;
+                  return (
+                    <button
+                      key={bKey}
+                      type="button"
+                      onClick={() => {
+                        setActiveNav('board_overview');
+                        setSelectedBucket(bKey);
+                      }}
+                      className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md transition-colors cursor-pointer ${
+                        isSelected
+                          ? 'bg-slate-100 dark:bg-slate-800 font-semibold text-slate-900 dark:text-white'
+                          : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-900'
+                      }`}
+                    >
+                      <span>{bLabel}</span>
+                      <span className="font-mono text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
+                        {bCount}
+                      </span>
+                    </button>
+                  );
+                })}
               </div>
             )}
-            <div className="flex flex-wrap items-center justify-center gap-3">
-              <button
-                type="button"
-                onClick={() => void performLivePoll()}
-                className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 cursor-pointer"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span>Retry Live Connection</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setAdapterModalOpen(true)}
-                className="px-4 py-2 text-xs font-medium text-slate-700 bg-slate-100 rounded-lg hover:bg-slate-200 cursor-pointer"
-              >
-                Configure Endpoint / Simulate Stale Snapshot
-              </button>
-              <button
-                type="button"
-                onClick={() => setMode('demo')}
-                className="px-4 py-2 text-xs font-medium text-slate-700 border border-slate-300 rounded-lg hover:bg-slate-50 cursor-pointer"
-              >
-                Switch to Explicit Demo Mode
-              </button>
+          </div>
+
+          {/* Sidebar Footer: Connection & Clock Summary */}
+          <div className="pt-4 border-t border-slate-200 dark:border-slate-800 px-2 text-[11px] text-slate-500 dark:text-slate-400 space-y-1">
+            <div className="flex items-center gap-1.5 font-medium text-slate-700 dark:text-slate-300">
+              {mode === 'demo' ? (
+                <>
+                  <Database className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                  <span>Demo Fixtures</span>
+                </>
+              ) : effectiveConnectionHealth === 'connected' ? (
+                <>
+                  <Wifi className="w-3.5 h-3.5 text-teal-500 shrink-0" />
+                  <span>Connected</span>
+                </>
+              ) : (
+                <>
+                  <WifiOff className="w-3.5 h-3.5 text-red-500 shrink-0" />
+                  <span>{effectiveConnectionHealth.replace('_', ' ')}</span>
+                </>
+              )}
             </div>
-          </section>
-        ) : activeSnapshot ? (
-          <>
-            {/* VIEW: CONTRACT & AUTOMATED TESTS */}
-            {activeNav === 'contract_tests' && <ContractAndTestsView />}
+            <div className="font-mono tabular-nums text-[10px]">
+              Clock: {formatUtcShort(referenceNowIso)}
+            </div>
+          </div>
+        </aside>
 
-            {/* VIEW: WORKERS & RUNS */}
-            {activeNav === 'workers_runs' && (
-              <WorkersAndRunsView
-                snapshot={activeSnapshot}
-                referenceNowIso={referenceNowIso}
-                onSelectProject={(id) => setSelectedProjectId(id)}
-              />
-            )}
+        {/* Mobile Drawer Sidebar */}
+        {mobileSidebarOpen && (
+          <div className="fixed inset-0 z-50 md:hidden flex">
+            <div className="w-64 bg-white dark:bg-[#111827] border-r border-slate-200 dark:border-slate-800 p-4 flex flex-col justify-between">
+              <div className="space-y-4">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-bold text-slate-900 dark:text-white">
+                    dot · Projects Board
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setMobileSidebarOpen(false)}
+                    aria-label="Close navigation menu"
+                    className="p-1 text-slate-500"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+                <nav className="space-y-1 text-xs">
+                  {(
+                    [
+                      ['board_overview', 'Board Overview'],
+                      ['today_focus', 'Today Focus'],
+                      ['attention_queue', `Attention Needed (${openDecisionsCount})`],
+                      ['workers_runs', 'Workers & Runs'],
+                      ['archived', `Archived (${archivedProjects.length})`],
+                      ['contract_tests', 'Contract & Tests'],
+                    ] as const
+                  ).map(([id, label]) => (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => {
+                        setActiveNav(id);
+                        setMobileSidebarOpen(false);
+                      }}
+                      className={`w-full text-left px-3 py-2 rounded-md font-medium ${
+                        activeNav === id
+                          ? 'bg-slate-900 dark:bg-sky-600 text-white'
+                          : 'text-slate-700 dark:text-slate-300'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </nav>
+              </div>
+            </div>
+            <div
+              className="flex-1 bg-slate-900/40"
+              onClick={() => setMobileSidebarOpen(false)}
+            />
+          </div>
+        )}
 
-            {/* VIEW: ATTENTION QUEUE ONLY */}
-            {activeNav === 'attention_queue' && (
-              <AttentionPanel
-                decisions={activeSnapshot.decisions}
-                projects={activeSnapshot.projects}
-                referenceNowIso={referenceNowIso}
-                capabilities={effectiveCapabilities}
-                onSelectProject={(id) => setSelectedProjectId(id)}
-                onResolveDecision={handleResolveDecision}
-                onSendReminder={handleSendReminder}
-              />
-            )}
+        {/* Right Main Column: Clean Header + Workspace Content */}
+        <div className="flex-1 flex flex-col min-w-0">
+          {/* Top Header */}
+          <header className="bg-white dark:bg-[#111827] border-b border-slate-200 dark:border-slate-800 px-4 sm:px-6 py-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              {/* Left: Mobile Menu Trigger + View Title + Connection Status & Last Update */}
+              <div className="flex items-center gap-3 min-w-0">
+                <button
+                  type="button"
+                  onClick={() => setMobileSidebarOpen(true)}
+                  aria-label="Open navigation menu"
+                  className="md:hidden p-1.5 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded"
+                >
+                  <Menu className="w-4 h-4" />
+                </button>
 
-            {/* VIEW: COMMAND CENTER OR ARCHIVED */}
-            {(activeNav === 'command_center' || activeNav === 'archived') && (
-              <>
-                {/* Overview 5-Bucket KPI Strip (Only on main Command Center) */}
-                {activeNav === 'command_center' && (
-                  <section aria-label="Execution & Completion Overview" className="mb-8">
-                    <div className="flex flex-col sm:flex-row sm:items-end justify-between gap-2 mb-4">
-                      <div>
-                        <h1 className="text-2xl font-bold text-slate-900 tracking-tight">
-                          Execution, Blockers & Verification Overview
-                        </h1>
-                        <p className="text-xs text-slate-600 mt-0.5">
-                          Separating active execution (fresh heartbeat + progress) from blocked
-                          work, pending operator decisions, unfinished scope, and verified
-                          completion.
-                        </p>
-                      </div>
-                      <div className="text-xs font-mono text-slate-500 tabular-nums">
-                        Snapshot: {activeSnapshot.snapshotId} · Schema:{' '}
-                        {activeSnapshot.schemaVersion}
-                      </div>
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h1 className="text-sm font-bold text-slate-900 dark:text-white tracking-tight">
+                      {activeNav === 'board_overview'
+                        ? 'Command Center Board'
+                        : activeNav === 'today_focus'
+                        ? 'Today Operational Focus'
+                        : activeNav === 'attention_queue'
+                        ? 'Attention Queue'
+                        : activeNav === 'workers_runs'
+                        ? 'Workers & Runs Telemetry'
+                        : activeNav === 'archived'
+                        ? 'Archived Projects'
+                        : 'Integration Contract & Verification'}
+                    </h1>
+                    <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
+                      ·
+                    </span>
+                    <span className="text-xs font-mono text-slate-500 dark:text-slate-400 tabular-nums">
+                      {mode === 'demo'
+                        ? `Demo snapshot (${formatRelativeAge(
+                            activeSnapshot?.generatedAt,
+                            referenceNowIso
+                          )})`
+                        : liveLastSyncedAt
+                        ? `Last live update: ${formatRelativeAge(
+                            liveLastSyncedAt,
+                            referenceNowIso
+                          )}`
+                        : 'Live: Never connected'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Right Controls: Search + Row/Card Toggle + Theme Switch + Adapter Button */}
+              <div className="flex flex-wrap items-center gap-2">
+                {(activeNav === 'board_overview' || activeNav === 'archived') && (
+                  <>
+                    <div className="relative w-48 sm:w-60">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="search"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        placeholder="Search projects, steps..."
+                        aria-label="Search projects"
+                        className="w-full text-xs bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded pl-8 pr-2.5 py-1.5 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-600"
+                      />
                     </div>
 
-                    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3.5">
-                      {(
-                        [
-                          {
-                            id: 'working_now',
-                            label: 'Working Now',
-                            count: bucketCounts.working_now,
-                            desc: 'Fresh heartbeat + fresh progress',
-                            accent: 'text-emerald-800',
-                          },
-                          {
-                            id: 'blocked',
-                            label: 'Blocked',
-                            count: bucketCounts.blocked,
-                            desc: 'Crash, gate failure, stall, or blocker',
-                            accent: 'text-red-700',
-                          },
-                          {
-                            id: 'waiting_for_me',
-                            label: 'Waiting for Me',
-                            count: bucketCounts.waiting_for_me,
-                            desc: 'Open decision owned by you',
-                            accent: 'text-amber-800',
-                          },
-                          {
-                            id: 'unfinished',
-                            label: 'Unfinished',
-                            count: bucketCounts.unfinished,
-                            desc: 'Remaining milestones or unverified',
-                            accent: 'text-slate-900',
-                          },
-                          {
-                            id: 'recently_verified_complete',
-                            label: 'Verified Complete',
-                            count: bucketCounts.recently_verified_complete,
-                            desc: 'All required acceptance gates passed',
-                            accent: 'text-emerald-800',
-                          },
-                        ] as const
-                      ).map((card) => {
-                        const isSelected = selectedBucket === card.id;
-                        return (
-                          <button
-                            key={card.id}
-                            type="button"
-                            onClick={() =>
-                              setSelectedBucket((prev) =>
-                                prev === card.id ? 'all' : card.id
-                              )
-                            }
-                            className={`text-left p-4 rounded-xl border transition-colors cursor-pointer ${
-                              isSelected
-                                ? 'bg-slate-900 text-white border-slate-900'
-                                : 'bg-white text-slate-900 border-slate-200 hover:border-slate-300'
-                            }`}
-                          >
-                            <div
-                              className={`text-xs font-medium mb-1 ${
-                                isSelected ? 'text-slate-300' : 'text-slate-500'
-                              }`}
-                            >
-                              {card.label}
-                            </div>
-                            <div
-                              className={`text-3xl font-bold font-mono tabular-nums ${
-                                isSelected ? 'text-white' : card.accent
-                              }`}
-                            >
-                              {card.count}
-                            </div>
-                            <div
-                              className={`text-[11px] mt-1.5 leading-snug ${
-                                isSelected ? 'text-slate-300' : 'text-slate-500'
-                              }`}
-                            >
-                              {card.desc}
-                            </div>
-                          </button>
-                        );
-                      })}
+                    {/* Compact Rows vs Cards Toggle */}
+                    <div
+                      role="group"
+                      aria-label="Project layout view"
+                      className="inline-flex items-center p-0.5 bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => setDisplayLayout('rows')}
+                        title="Compact Rows (Default)"
+                        className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-xs cursor-pointer ${
+                          displayLayout === 'rows'
+                            ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-2xs'
+                            : 'text-slate-600 dark:text-slate-400'
+                        }`}
+                      >
+                        <List className="w-3.5 h-3.5" />
+                        <span>Rows</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setDisplayLayout('cards')}
+                        title="Expanded Cards"
+                        className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-xs cursor-pointer ${
+                          displayLayout === 'cards'
+                            ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-2xs'
+                            : 'text-slate-600 dark:text-slate-400'
+                        }`}
+                      >
+                        <LayoutGrid className="w-3.5 h-3.5" />
+                        <span>Cards</span>
+                      </button>
                     </div>
-                  </section>
+                  </>
                 )}
 
-                {/* Prominent Attention Panel on Command Center */}
-                {activeNav === 'command_center' && (
+                {/* Light / Dark Theme Toggle */}
+                <button
+                  type="button"
+                  onClick={() => setTheme((t) => (t === 'light' ? 'dark' : 'light'))}
+                  aria-label={
+                    theme === 'light' ? 'Switch to dark theme' : 'Switch to light theme'
+                  }
+                  title={theme === 'light' ? 'Switch to Dark Theme' : 'Switch to Light Theme'}
+                  className="p-1.5 text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded hover:bg-slate-200 dark:hover:bg-slate-800 cursor-pointer"
+                >
+                  {theme === 'light' ? (
+                    <Moon className="w-3.5 h-3.5" />
+                  ) : (
+                    <Sun className="w-3.5 h-3.5" />
+                  )}
+                </button>
+
+                {/* Adapter Config */}
+                <button
+                  type="button"
+                  onClick={() => setAdapterModalOpen(true)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-slate-900 dark:bg-sky-600 hover:bg-slate-800 dark:hover:bg-sky-700 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Sliders className="w-3.5 h-3.5" />
+                  <span>Adapter &amp; Mode</span>
+                </button>
+              </div>
+            </div>
+          </header>
+
+          {/* Main Workspace Scroll Area */}
+          <main className="flex-1 p-4 sm:p-6 max-w-full overflow-x-hidden">
+            {/* Action Feedback / Undo Banner */}
+            {feedbackBanner && (
+              <div
+                role="status"
+                className={`flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 rounded-lg border mb-5 text-xs ${
+                  feedbackBanner.tone === 'success'
+                    ? 'bg-teal-50 dark:bg-teal-950/40 border-teal-200 dark:border-teal-900 text-teal-950 dark:text-teal-200'
+                    : feedbackBanner.tone === 'danger'
+                    ? 'bg-red-50 dark:bg-red-950/40 border-red-200 dark:border-red-900 text-red-950 dark:text-red-200'
+                    : 'bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-900 text-amber-950 dark:text-amber-200'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  {feedbackBanner.tone === 'success' ? (
+                    <CheckCircle2 className="w-4 h-4 text-teal-700 dark:text-teal-400 shrink-0" />
+                  ) : feedbackBanner.tone === 'danger' ? (
+                    <XCircle className="w-4 h-4 text-red-700 dark:text-red-400 shrink-0" />
+                  ) : (
+                    <AlertTriangle className="w-4 h-4 text-amber-700 dark:text-amber-400 shrink-0" />
+                  )}
+                  <span className="font-medium">{feedbackBanner.message}</span>
+                </div>
+                <div className="flex items-center gap-3">
+                  {feedbackBanner.undoProjectId !== undefined &&
+                    feedbackBanner.undoTargetArchiveState !== undefined && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          handleToggleArchive(
+                            feedbackBanner.undoProjectId!,
+                            feedbackBanner.undoTargetArchiveState!
+                          )
+                        }
+                        className="inline-flex items-center gap-1 font-semibold underline underline-offset-4 cursor-pointer"
+                      >
+                        <Undo2 className="w-3.5 h-3.5" />
+                        <span>Undo</span>
+                      </button>
+                    )}
+                  <button
+                    type="button"
+                    onClick={() => setFeedbackBanner(null)}
+                    className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white cursor-pointer"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* LIVE MODE: NOT CONNECTED EMPTY STATE (Never substitutes synthetic data!) */}
+            {mode === 'live' && !activeSnapshot ? (
+              <section className="bg-white dark:bg-[#111827] border border-slate-300 dark:border-slate-800 rounded-xl p-8 text-center max-w-xl mx-auto my-8">
+                <WifiOff className="w-9 h-9 text-red-600 dark:text-red-400 mx-auto mb-3" />
+                <h2 className="text-lg font-bold text-slate-900 dark:text-white mb-1.5">
+                  Not Connected to Local Mission Control
+                </h2>
+                <p className="text-xs text-slate-600 dark:text-slate-400 mb-4 leading-relaxed">
+                  Live Mode is active and waiting for a verified{' '}
+                  <code className="font-mono">{CONTRACT_SCHEMA_VERSION}</code> snapshot from{' '}
+                  <code className="font-mono bg-slate-100 dark:bg-slate-900 px-1.5 py-0.5 rounded">
+                    {liveConfig.endpointBaseUrl}/snapshot
+                  </code>
+                  . Synthetic demo fixtures are never displayed in Live Mode.
+                </p>
+                {liveWarningOrError && (
+                  <div className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 rounded p-3 text-xs font-mono text-red-800 dark:text-red-300 mb-5 text-left">
+                    {liveWarningOrError} (Failed attempts: {consecutiveFailures})
+                  </div>
+                )}
+                <div className="flex flex-wrap items-center justify-center gap-2.5">
+                  <button
+                    type="button"
+                    disabled={isPollingLive}
+                    onClick={() => void performLivePoll()}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded disabled:opacity-50 cursor-pointer"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${isPollingLive ? 'animate-spin' : ''}`} />
+                    <span>{isPollingLive ? 'Polling...' : 'Retry Live Connection'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAdapterModalOpen(true)}
+                    className="px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 rounded hover:bg-slate-200 cursor-pointer"
+                  >
+                    Configure Endpoint
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSwitchMode('demo')}
+                    className="px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-900 cursor-pointer"
+                  >
+                    Switch to Demo Mode
+                  </button>
+                </div>
+              </section>
+            ) : activeSnapshot ? (
+              <>
+                {activeNav === 'contract_tests' && <ContractAndTestsView />}
+
+                {activeNav === 'today_focus' && (
+                  <TodayView
+                    snapshot={activeSnapshot}
+                    evaluatedProjects={allEvaluatedProjects}
+                    referenceNowIso={referenceNowIso}
+                    onSelectProject={(id) => setSelectedProjectId(id)}
+                  />
+                )}
+
+                {activeNav === 'workers_runs' && (
+                  <WorkersAndRunsView
+                    snapshot={activeSnapshot}
+                    referenceNowIso={referenceNowIso}
+                    onSelectProject={(id) => setSelectedProjectId(id)}
+                  />
+                )}
+
+                {activeNav === 'attention_queue' && (
                   <AttentionPanel
                     decisions={activeSnapshot.decisions}
                     projects={activeSnapshot.projects}
                     referenceNowIso={referenceNowIso}
                     capabilities={effectiveCapabilities}
+                    selectedProjectId={selectedProjectId}
                     onSelectProject={(id) => setSelectedProjectId(id)}
                     onResolveDecision={handleResolveDecision}
                     onSendReminder={handleSendReminder}
                   />
                 )}
 
-                {/* Search, Bucket Filter & Discoverability Toolbar */}
-                <section aria-label="Project Filter Controls" className="mb-6">
-                  <div className="bg-white border border-slate-200 rounded-xl p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-                    {/* Left: Segmented Bucket Filter or Archived Header */}
-                    {activeNav === 'archived' ? (
-                      <div className="flex items-center gap-2">
-                        <Archive className="w-4 h-4 text-slate-600" />
-                        <div>
-                          <h2 className="text-sm font-semibold text-slate-900">
-                            Archived Projects ({archivedProjects.length})
-                          </h2>
-                          <p className="text-xs text-slate-500">
-                            Archiving hides projects from the main queue without deleting files or
-                            cancelling jobs. Old unfinished work remains discoverable here.
-                          </p>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 rounded-lg">
-                        {(
-                          [
-                            ['all', `All Active (${activeUnarchivedProjects.length})`],
-                            ['working_now', `Working Now (${bucketCounts.working_now})`],
-                            ['blocked', `Blocked (${bucketCounts.blocked})`],
-                            ['waiting_for_me', `Waiting for Me (${bucketCounts.waiting_for_me})`],
-                            ['unfinished', `Unfinished (${bucketCounts.unfinished})`],
-                            [
-                              'recently_verified_complete',
-                              `Verified (${bucketCounts.recently_verified_complete})`,
-                            ],
-                          ] as const
-                        ).map(([bKey, bLabel]) => (
-                          <button
-                            key={bKey}
-                            type="button"
-                            onClick={() => setSelectedBucket(bKey)}
-                            className={`px-2.5 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                              selectedBucket === bKey
-                                ? 'bg-white text-slate-900 shadow-xs'
-                                : 'text-slate-600 hover:text-slate-900'
-                            }`}
-                          >
-                            {bLabel}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-
-                    {/* Right: Search + Owner & Priority Filters */}
-                    <div className="flex flex-wrap items-center gap-2.5">
-                      <div className="relative flex-1 sm:w-64">
-                        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                        <input
-                          type="search"
-                          value={searchQuery}
-                          onChange={(e) => setSearchQuery(e.target.value)}
-                          placeholder="Search projects, milestones, blockers..."
-                          aria-label="Search projects"
-                          className="w-full text-xs bg-slate-50 border border-slate-300 rounded-md pl-8 pr-3 py-1.5 text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900"
-                        />
-                      </div>
-
-                      <select
-                        aria-label="Filter by owner"
-                        value={ownerFilter}
-                        onChange={(e) => setOwnerFilter(e.target.value)}
-                        className="text-xs bg-slate-50 border border-slate-300 rounded-md px-2.5 py-1.5 text-slate-700"
-                      >
-                        <option value="all">All Owners</option>
-                        {uniqueOwners.map((o) => (
-                          <option key={o} value={o}>
-                            Owner: {o}
-                          </option>
-                        ))}
-                      </select>
-
-                      <select
-                        aria-label="Filter by priority"
-                        value={priorityFilter}
-                        onChange={(e) => setPriorityFilter(e.target.value)}
-                        className="text-xs bg-slate-50 border border-slate-300 rounded-md px-2.5 py-1.5 text-slate-700"
-                      >
-                        <option value="all">All Priorities</option>
-                        <option value="critical">Critical</option>
-                        <option value="high">High</option>
-                        <option value="normal">Normal</option>
-                        <option value="low">Low</option>
-                      </select>
-                    </div>
-                  </div>
-                </section>
-
-                {/* Project Cards List */}
-                {filteredProjects.length === 0 ? (
-                  <div className="bg-white border border-slate-200 rounded-xl p-10 text-center">
-                    <p className="text-sm font-semibold text-slate-900 mb-1">
-                      No projects match the current filter
-                    </p>
-                    <p className="text-xs text-slate-500 mb-4">
-                      Try clearing your search query or switching the overview filter.
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setSelectedBucket('all');
-                        setOwnerFilter('all');
-                        setPriorityFilter('all');
-                        setSearchQuery('');
-                      }}
-                      className="px-3.5 py-1.5 text-xs font-medium text-white bg-slate-900 rounded-md hover:bg-slate-800 cursor-pointer"
-                    >
-                      Reset Filters
-                    </button>
-                  </div>
-                ) : (
-                  <div className="space-y-5">
-                    {filteredProjects.map((ep) => (
-                      <ProjectCard
-                        key={ep.project.projectId}
-                        evaluated={ep}
+                {(activeNav === 'board_overview' || activeNav === 'archived') && (
+                  <div className="space-y-6">
+                    {/* 1. Attention Panel at Top of Board Overview */}
+                    {activeNav === 'board_overview' && (
+                      <AttentionPanel
+                        decisions={activeSnapshot.decisions}
+                        projects={activeSnapshot.projects}
                         referenceNowIso={referenceNowIso}
                         capabilities={effectiveCapabilities}
+                        selectedProjectId={selectedProjectId}
                         onSelectProject={(id) => setSelectedProjectId(id)}
-                        onChangePriority={handleChangePriority}
-                        onToggleArchive={handleToggleArchive}
+                        onResolveDecision={handleResolveDecision}
                         onSendReminder={handleSendReminder}
                       />
-                    ))}
+                    )}
+
+                    {/* Filter Bar: Segmented Status Pills + Owner & Priority Selectors */}
+                    <section
+                      aria-label="Filter Bar"
+                      className="flex flex-wrap items-center justify-between gap-3 bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg px-4 py-2.5"
+                    >
+                      {activeNav === 'archived' ? (
+                        <div className="flex items-center gap-2 text-xs">
+                          <Archive className="w-4 h-4 text-slate-500" />
+                          <span className="font-semibold text-slate-900 dark:text-slate-100">
+                            Archived Projects ({archivedProjects.length})
+                          </span>
+                          <span className="text-slate-500 dark:text-slate-400">
+                            — Unfinished work stays discoverable; archiving never deletes files
+                            or cancels workers.
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="flex flex-wrap items-center gap-1">
+                          {(
+                            [
+                              ['all', 'All', activeUnarchivedProjects.length],
+                              ['working_now', 'Running', bucketCounts.working_now],
+                              ['waiting_for_me', 'Needs Me', bucketCounts.waiting_for_me],
+                              ['blocked', 'Blocked', bucketCounts.blocked],
+                              ['unfinished', 'Unfinished', bucketCounts.unfinished],
+                              [
+                                'recently_verified_complete',
+                                'Completed',
+                                bucketCounts.recently_verified_complete,
+                              ],
+                            ] as const
+                          ).map(([bKey, bLabel, bCount]) => (
+                            <button
+                              key={bKey}
+                              type="button"
+                              onClick={() => setSelectedBucket(bKey)}
+                              className={`px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                                selectedBucket === bKey
+                                  ? 'bg-slate-900 dark:bg-sky-600 text-white'
+                                  : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
+                              }`}
+                            >
+                              <span>{bLabel}</span>
+                              <span
+                                className={`ml-1.5 font-mono text-[11px] tabular-nums ${
+                                  selectedBucket === bKey
+                                    ? 'text-slate-200 dark:text-sky-100'
+                                    : 'text-slate-400 dark:text-slate-500'
+                                }`}
+                              >
+                                {bCount}
+                              </span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <select
+                          aria-label="Filter by owner"
+                          value={ownerFilter}
+                          onChange={(e) => setOwnerFilter(e.target.value)}
+                          className="text-xs bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1 text-slate-700 dark:text-slate-200"
+                        >
+                          <option value="all">All Owners</option>
+                          {uniqueOwners.map((o) => (
+                            <option key={o} value={o}>
+                              Owner: {o}
+                            </option>
+                          ))}
+                        </select>
+
+                        <select
+                          aria-label="Filter by priority"
+                          value={priorityFilter}
+                          onChange={(e) => setPriorityFilter(e.target.value)}
+                          className="text-xs bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1 text-slate-700 dark:text-slate-200"
+                        >
+                          <option value="all">All Priorities</option>
+                          <option value="critical">Critical</option>
+                          <option value="high">High</option>
+                          <option value="normal">Normal</option>
+                          <option value="low">Low</option>
+                        </select>
+                      </div>
+                    </section>
+
+                    {/* Project List: Hierarchy View when showing 'all' on Board Overview, or flat filtered list */}
+                    {filteredProjects.length === 0 ? (
+                      <div className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg p-8 text-center">
+                        <p className="text-sm font-semibold text-slate-900 dark:text-white mb-1">
+                          No projects match the current filter
+                        </p>
+                        <p className="text-xs text-slate-500 dark:text-slate-400 mb-3">
+                          Clear your search or reset status filters to inspect all projects.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSelectedBucket('all');
+                            setOwnerFilter('all');
+                            setPriorityFilter('all');
+                            setSearchQuery('');
+                          }}
+                          className="px-3 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded cursor-pointer"
+                        >
+                          Reset Filters
+                        </button>
+                      </div>
+                    ) : activeNav === 'board_overview' && selectedBucket === 'all' ? (
+                      <div className="space-y-6">
+                        {/* Section 1: Needs Attention / Blocked First */}
+                        {hierarchySections.attentionOrBlocked.length > 0 && (
+                          <section aria-label="Blocked and Needs Attention Projects">
+                            <div className="flex items-center justify-between mb-2 px-1">
+                              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
+                                1. Blocked &amp; Needs Attention (
+                                {hierarchySections.attentionOrBlocked.length})
+                              </h2>
+                              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                                Confirmed failures, stalled progress, or pending operator decisions
+                              </span>
+                            </div>
+                            {renderProjectCollection(hierarchySections.attentionOrBlocked)}
+                          </section>
+                        )}
+
+                        {/* Section 2: Current Work Second */}
+                        {hierarchySections.currentWork.length > 0 && (
+                          <section aria-label="Currently Running Projects">
+                            <div className="flex items-center justify-between mb-2 px-1">
+                              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
+                                2. Current Work — Confirmed Running (
+                                {hierarchySections.currentWork.length})
+                              </h2>
+                              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                                Fresh worker heartbeats and verified progress
+                              </span>
+                            </div>
+                            {renderProjectCollection(hierarchySections.currentWork)}
+                          </section>
+                        )}
+
+                        {/* Section 3: Unfinished Backlog & Verified Complete Third */}
+                        {hierarchySections.backlogAndCompleted.length > 0 && (
+                          <section aria-label="Unfinished Backlog and Verified Complete Projects">
+                            <div className="flex items-center justify-between mb-2 px-1">
+                              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
+                                3. Unfinished Backlog &amp; Verified Complete (
+                                {hierarchySections.backlogAndCompleted.length})
+                              </h2>
+                              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                                Idle, queued, unknown coverage, or strictly verified complete
+                              </span>
+                            </div>
+                            {renderProjectCollection(hierarchySections.backlogAndCompleted)}
+                          </section>
+                        )}
+                      </div>
+                    ) : (
+                      renderProjectCollection(filteredProjects)
+                    )}
+
+                    {/* Expandable Technical Diagnostics Section */}
+                    <section
+                      aria-label="Technical Diagnostics"
+                      className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg px-4 py-3"
+                    >
+                      <div className="flex items-center justify-between">
+                        <div className="text-xs text-slate-600 dark:text-slate-400">
+                          <span className="font-semibold text-slate-800 dark:text-slate-200">
+                            Technical Diagnostics &amp; Thresholds
+                          </span>
+                          <span className="ml-2 font-mono text-[11px]">
+                            Schema: {activeSnapshot.schemaVersion} · Snapshot:{' '}
+                            {activeSnapshot.snapshotId}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setDiagnosticsExpanded((prev) => !prev)}
+                          className="inline-flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white cursor-pointer"
+                        >
+                          {diagnosticsExpanded ? (
+                            <>
+                              <ChevronUp className="w-3.5 h-3.5" />
+                              <span>Hide Diagnostics</span>
+                            </>
+                          ) : (
+                            <>
+                              <ChevronDown className="w-3.5 h-3.5" />
+                              <span>Expand Diagnostics</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+
+                      {diagnosticsExpanded && (
+                        <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-800 grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs font-mono text-slate-600 dark:text-slate-400">
+                          <div>
+                            <div className="text-[11px] text-slate-400">Heartbeat Expiry</div>
+                            <div>
+                              {activeSnapshot.evaluationThresholds.heartbeatExpirySeconds}s
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[11px] text-slate-400">
+                              Stalled Progress Limit
+                            </div>
+                            <div>
+                              {activeSnapshot.evaluationThresholds.stalledProgressSeconds}s (
+                              {Math.floor(
+                                activeSnapshot.evaluationThresholds.stalledProgressSeconds / 60
+                              )}
+                              m)
+                            </div>
+                          </div>
+                          <div>
+                            <div className="text-[11px] text-slate-400">Evaluation Clock</div>
+                            <div>{formatUtcShort(referenceNowIso)}</div>
+                          </div>
+                          <div>
+                            <div className="text-[11px] text-slate-400">Command Capabilities</div>
+                            <div>
+                              {effectiveCapabilities.canChangePriority
+                                ? 'Writable (Demo)'
+                                : 'Read-Only'}
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </section>
                   </div>
                 )}
               </>
-            )}
-          </>
-        ) : null}
-      </main>
-
-      {/* Quiet Footer (No fake telemetry tickers) */}
-      <footer className="bg-white border-t border-slate-200 px-4 sm:px-8 py-4 mt-12 text-xs text-slate-500">
-        <div className="max-w-[1400px] mx-auto flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <span>dot Mission Control UI · Contract Schema </span>
-            <code className="font-mono text-slate-700">{CONTRACT_SCHEMA_VERSION}</code>
-          </div>
-          <div className="flex items-center gap-4">
-            <button
-              type="button"
-              onClick={() => setActiveNav('contract_tests')}
-              className="hover:text-slate-900 underline-offset-4 hover:underline cursor-pointer"
-            >
-              Integration Contract & 11 Automated Tests
-            </button>
-            <button
-              type="button"
-              onClick={() => setAdapterModalOpen(true)}
-              className="hover:text-slate-900 underline-offset-4 hover:underline cursor-pointer"
-            >
-              Adapter Settings
-            </button>
-          </div>
+            ) : null}
+          </main>
         </div>
-      </footer>
+      </div>
 
-      {/* Project Detail Modal */}
+      {/* Slide-Over Side Panel for Selected Project */}
       {selectedEvaluatedProject && activeSnapshot && (
         <ProjectDetailModal
           evaluated={selectedEvaluatedProject}
@@ -1174,33 +1566,33 @@ export default function App() {
         />
       )}
 
-      {/* Adapter Configuration & Diagnostic Simulation Modal */}
+      {/* Adapter Configuration Modal */}
       {adapterModalOpen && (
         <AdapterConfigModal
           mode={mode}
           liveConfig={liveConfig}
           capabilitiesReadOnlySimulated={capabilitiesReadOnlySimulated}
-          staleLiveSimulated={staleLiveSimulated}
+          demoClockOffsetSeconds={demoClockOffsetSeconds}
           onClose={() => setAdapterModalOpen(false)}
-          onSwitchMode={(nextMode) => {
-            setStaleLiveSimulated(false);
-            if (nextMode === 'live') {
-              setLiveSnapshot(null);
-              setLiveConnectionHealth('not_connected');
-              setMode('live');
+          onSwitchMode={handleSwitchMode}
+          onUpdateLiveConfig={(cfg) => {
+            liveCoordinatorRef.current.invalidateAndReset(false);
+            setLiveConfig(cfg);
+            if (mode === 'live') {
               void performLivePoll();
-            } else {
-              setMode('demo');
             }
           }}
-          onUpdateLiveConfig={(cfg) => setLiveConfig(cfg)}
           onTriggerLivePollNow={() => {
-            setStaleLiveSimulated(false);
-            setMode('live');
-            void performLivePoll();
+            if (mode !== 'live') {
+              handleSwitchMode('live');
+            } else {
+              void performLivePoll();
+            }
           }}
           onToggleCapabilitiesReadOnly={handleToggleCapabilitiesReadOnly}
-          onToggleSimulateStaleLive={handleToggleSimulateStaleLive}
+          onAdvanceDemoClockSeconds={(delta) =>
+            setDemoClockOffsetSeconds((prev) => prev + delta)
+          }
           onResetDemoFixtures={handleResetDemoFixtures}
         />
       )}

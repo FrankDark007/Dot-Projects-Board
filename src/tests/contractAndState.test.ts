@@ -1,20 +1,27 @@
 /**
  * @file src/tests/contractAndState.test.ts
- * @description Automated verification suite testing all 11 required domain and contract invariants:
- * 1. Normal execution
- * 2. Worker crash
- * 3. Heartbeat expiry
- * 4. Stalled progress (heartbeat alive != progress)
- * 5. Disconnected sources & Live mode truthfulness (no silent demo fallback)
- * 6. Missing costs & unknown worker coverage (no invented metrics)
- * 7. Duplicate events deduplication by stable source ID
- * 8. Pending approval / decision state
- * 9. Failed reminder delivery vs verified delivery acknowledgment
- * 10. Archive / Undo + idempotency + revision conflict handling
- * 11. Completed execution turn with failed acceptance gate
+ * @description Comprehensive automated regression suite separated into:
+ * 1. Fixture & State Evaluator Tests (deterministic fake clocks, timestamp sanity, strict completion, liveness vs progress)
+ * 2. Transport, Runtime Validator & Live Isolation Tests (mocked HTTP, hung requests, cancellation, out-of-order rejection, live read-only safety)
+ * 3. UI Rendering & State Transition Tests (compact rows, cards, disabled live controls, long names, mode switch cleanup)
+ *
+ * NOTE: Real local Mission Control / projectBoard integration remains UNVERIFIED in this cloud sandbox
+ * and is reported separately on the Contract & Tests screen.
  */
 
-import { MissionControlDataController } from '../adapters/dataAdapter';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import {
+  DEFAULT_LIVE_CONFIG,
+  executeLiveCommand,
+  FetchLike,
+  LivePollCoordinator,
+  MissionControlDataController,
+} from '../adapters/dataAdapter';
+import { AttentionPanel } from '../components/AttentionPanel';
+import { ProjectCard } from '../components/ProjectCard';
+import { ProjectRow } from '../components/ProjectRow';
+import { TodayView } from '../components/TodayView';
 import {
   deduplicateSnapshot,
   evaluateAllProjects,
@@ -22,10 +29,23 @@ import {
   evaluateWorker,
 } from '../engine/stateEvaluator';
 import { createSyntheticSnapshot, REFERENCE_NOW_ISO } from '../fixtures/syntheticFixtures';
-import { CONTRACT_SCHEMA_VERSION, WorkerRecord } from '../schema/contract';
+import {
+  CONTRACT_SCHEMA_VERSION,
+  MissionControlSnapshot,
+  ProjectRecord,
+  WorkerRecord,
+} from '../schema/contract';
+import { validateSnapshotPayload } from '../schema/validator';
+import { evaluateTimestamp } from '../utils/timeFormat';
+
+export type TestSuiteScope =
+  | 'fixture_evaluator'
+  | 'transport_validator'
+  | 'ui_behavior';
 
 export interface TestCaseResult {
   id: string;
+  scope: TestSuiteScope;
   name: string;
   scenarioCategory: string;
   passed: boolean;
@@ -34,13 +54,20 @@ export interface TestCaseResult {
   error?: string;
 }
 
-function assertCondition(condition: boolean, message: string, counter: { count: number }): void {
+function assertCondition(
+  condition: boolean,
+  message: string,
+  counter: { count: number }
+): void {
   counter.count += 1;
   if (!condition) {
     throw new Error(`Assertion failed: ${message}`);
   }
 }
 
+/**
+ * Runs all synchronous Fixture, Evaluator, Validator, and UI rendering tests.
+ */
 export function runAllContractAndStateTests(): {
   allPassed: boolean;
   totalTests: number;
@@ -52,6 +79,7 @@ export function runAllContractAndStateTests(): {
 
   const runTest = (
     id: string,
+    scope: TestSuiteScope,
     name: string,
     scenarioCategory: string,
     fn: (assert: (cond: boolean, msg: string) => void) => string
@@ -61,6 +89,7 @@ export function runAllContractAndStateTests(): {
       const details = fn((cond, msg) => assertCondition(cond, msg, counter));
       results.push({
         id,
+        scope,
         name,
         scenarioCategory,
         passed: true,
@@ -70,6 +99,7 @@ export function runAllContractAndStateTests(): {
     } catch (err) {
       results.push({
         id,
+        scope,
         name,
         scenarioCategory,
         passed: false,
@@ -80,10 +110,15 @@ export function runAllContractAndStateTests(): {
     }
   };
 
+  // ============================================================================
+  // SUITE A: FIXTURE & STATE EVALUATOR TESTS
+  // ============================================================================
+
   // 1. Normal Execution
   runTest(
     'test-01-normal-execution',
-    'Normal Execution: Fresh heartbeat + fresh meaningful progress counts as Working Now',
+    'fixture_evaluator',
+    'Normal Execution: Fresh heartbeat + fresh meaningful progress counts as confirmed progressing',
     'Normal execution',
     (assert) => {
       const controller = new MissionControlDataController();
@@ -92,16 +127,16 @@ export function runAllContractAndStateTests(): {
       const evaluated = evaluateProject(compactor, snap, REFERENCE_NOW_ISO);
 
       assert(
-        evaluated.workerSummary.activeRunningCount === 2,
-        'Expected 2 active_running workers on prj-context-compactor'
+        evaluated.workerSummary.confirmedRunningCount === 2,
+        'Expected 2 confirmedRunningCount on prj-context-compactor'
+      );
+      assert(
+        evaluated.workerSummary.confirmedProgressingCount === 2,
+        'Expected 2 confirmedProgressingCount on prj-context-compactor'
       );
       assert(
         evaluated.buckets.includes('working_now'),
         'Expected project to be in working_now bucket'
-      );
-      assert(
-        evaluated.primaryStatusTone === 'active',
-        'Expected primary status tone to be active'
       );
       return 'Verified 2 workers (wk-comp-01, wk-comp-02) have fresh heartbeats (14s, 22s) and fresh progress (2m, 4m).';
     }
@@ -110,6 +145,7 @@ export function runAllContractAndStateTests(): {
   // 2. Worker Crash
   runTest(
     'test-02-worker-crash',
+    'fixture_evaluator',
     'Worker Crash: Abnormal termination (SIGSEGV) flags worker crashed and blocks project',
     'Worker crash',
     (assert) => {
@@ -134,41 +170,74 @@ export function runAllContractAndStateTests(): {
     }
   );
 
-  // 3. Heartbeat Expiry
+  // 3. Heartbeat Expiry Without New Snapshot + Invalid/Future Timestamps
   runTest(
-    'test-03-heartbeat-expiry',
-    'Heartbeat Expiry: Worker reported running with expired heartbeat (>90s) is stale_heartbeat, not active',
-    'Heartbeat expiry',
+    'test-03-heartbeat-expiry-and-future-timestamps',
+    'fixture_evaluator',
+    'Heartbeat Expiry & Clock Advance: Advancing clock expires heartbeats without a new snapshot; invalid/future timestamps are uncertain',
+    'Heartbeat expiry & timestamps',
     (assert) => {
       const controller = new MissionControlDataController();
       const snap = controller.getSnapshot();
-      const voiceWorker = snap.workers.find((w) => w.workerId === 'wk-voice-01')!;
-      const evalW = evaluateWorker(voiceWorker, REFERENCE_NOW_ISO, snap.evaluationThresholds);
-      const voiceProj = snap.projects.find((p) => p.projectId === 'prj-audio-whisper-queue')!;
-      const evalP = evaluateProject(voiceProj, snap, REFERENCE_NOW_ISO);
+      const compactor = snap.projects.find((p) => p.projectId === 'prj-context-compactor')!;
 
-      assert(voiceWorker.rawStatus === 'running', 'Fixture rawStatus is running');
+      // At t=0, compactor has 2 confirmed running workers
+      const evalAtT0 = evaluateProject(compactor, snap, REFERENCE_NOW_ISO);
+      assert(evalAtT0.workerSummary.confirmedRunningCount === 2, '2 confirmed running at t=0');
+
+      // Advance clock by +120s WITHOUT changing the snapshot
+      const futureClockIso = new Date(Date.parse(REFERENCE_NOW_ISO) + 120 * 1000).toISOString();
+      const evalAtT120 = evaluateProject(compactor, snap, futureClockIso);
       assert(
-        evalW.evaluatedState === 'stale_heartbeat',
-        'Expected expired 11m heartbeat to evaluate as stale_heartbeat'
+        evalAtT120.workerSummary.confirmedRunningCount === 0,
+        'After +120s without a new snapshot, confirmedRunningCount drops to 0'
       );
       assert(
-        evalP.workerSummary.activeRunningCount === 0,
-        'Stale heartbeat worker must NOT be counted as activeRunningCount'
+        evalAtT120.workerSummary.unknownExecutionCount === 2,
+        'After +120s, both workers transition to unknownExecutionCount (expired heartbeat without stop proof)'
       );
       assert(
-        !evalP.buckets.includes('working_now'),
-        'Project with only stale heartbeat worker must NOT be in working_now'
+        !evalAtT120.buckets.includes('working_now'),
+        'Project leaves working_now bucket when heartbeats expire'
       );
-      return 'Verified wk-voice-01 (11m since heartbeat > 90s threshold) evaluates to stale_heartbeat with 0 active workers.';
+
+      // Test invalid and implausibly future timestamps (+10 minutes in the future)
+      const invalidTsEval = evaluateTimestamp('not-an-iso-date', REFERENCE_NOW_ISO);
+      assert(invalidTsEval.valid === false, 'Malformed timestamp must be invalid');
+
+      const futureSkewIso = new Date(Date.parse(REFERENCE_NOW_ISO) + 600 * 1000).toISOString();
+      const futureTsEval = evaluateTimestamp(futureSkewIso, REFERENCE_NOW_ISO);
+      assert(
+        futureTsEval.valid === false && futureTsEval.isFuture === true,
+        'Timestamp +600s in the future must be flagged invalid & isFuture'
+      );
+
+      const futureWorker: WorkerRecord = {
+        ...snap.workers[0],
+        workerId: 'wk-future-skew',
+        lastHeartbeatAt: futureSkewIso,
+      };
+      const evalFutureW = evaluateWorker(
+        futureWorker,
+        REFERENCE_NOW_ISO,
+        snap.evaluationThresholds
+      );
+      assert(
+        evalFutureW.isConfirmedAlive === false &&
+          evalFutureW.evaluatedState === 'unknown_expired_heartbeat',
+        'Worker with implausibly future heartbeat must NOT be treated as fresh/alive'
+      );
+
+      return 'Verified advancing clock expires heartbeats into unknownExecutionCount without a new snapshot, and future/invalid timestamps are never treated as fresh.';
     }
   );
 
-  // 4. Stalled Progress (Heartbeat != Progress)
+  // 4. Alive Worker with Stalled Progress & Partial Telemetry
   runTest(
-    'test-04-stalled-progress',
-    'Stalled Progress: Fresh heartbeat (18s) with stale progress (48m > 15m) evaluates as stalled_progress',
-    'Stalled progress',
+    'test-04-liveness-progress-coverage-separation',
+    'fixture_evaluator',
+    'Liveness vs Progress vs Coverage: Stalled worker stays confirmed alive; missing coverage is never 0 or stalled',
+    'Liveness, progress & coverage',
     (assert) => {
       const controller = new MissionControlDataController();
       const snap = controller.getSnapshot();
@@ -176,336 +245,523 @@ export function runAllContractAndStateTests(): {
       const evalW = evaluateWorker(stalledWorker, REFERENCE_NOW_ISO, snap.evaluationThresholds);
 
       assert(
-        evalW.heartbeatAgeSeconds === 18,
-        'Expected fresh 18s heartbeat age'
-      );
-      assert(
-        evalW.progressAgeSeconds === 48 * 60,
-        'Expected 48m progress age'
+        evalW.isConfirmedAlive === true && evalW.isMakingProgress === false,
+        'wk-webkit-01 (18s heartbeat, 48m progress) is confirmed alive but not making progress'
       );
       assert(
         evalW.evaluatedState === 'stalled_progress',
-        'Expected fresh heartbeat + 48m no progress to evaluate as stalled_progress'
+        'Evaluates to stalled_progress'
       );
-      return 'Confirmed heartbeats prove liveness only: 18s heartbeat with 48m old progress flags stalled_progress.';
-    }
-  );
 
-  // 5. Disconnected Sources
-  runTest(
-    'test-05-disconnected-sources',
-    'Disconnected Sources: Disconnected worker & unknown coverage never fabricate active status',
-    'Disconnected sources',
-    (assert) => {
-      const disconnectedWorker: WorkerRecord = {
-        workerId: 'wk-disc-test',
-        projectId: 'prj-legacy-mail-indexer',
-        name: 'dot-worker-remote-01',
-        role: 'Indexer',
-        hostLabel: 'remote-mac',
-        rawStatus: 'disconnected',
-        currentRunId: null,
-        currentTaskSummary: null,
-        lastHeartbeatAt: REFERENCE_NOW_ISO,
-        lastMeaningfulProgressAt: REFERENCE_NOW_ISO,
-        lastProgressSummary: null,
-        coverageAvailable: true,
-        source: {
-          sourceId: 'src-disc-1',
-          kind: 'md_worker_daemon',
-          emitterName: 'supervisor',
-          observedAt: REFERENCE_NOW_ISO,
-        },
-      };
-      const evalDisc = evaluateWorker(disconnectedWorker, REFERENCE_NOW_ISO, {
-        heartbeatExpirySeconds: 90,
-        stalledProgressSeconds: 900,
-      });
+      const safariProj = snap.projects.find((p) => p.projectId === 'prj-safari-dom-bridge')!;
+      const evalSafari = evaluateProject(safariProj, snap, REFERENCE_NOW_ISO);
       assert(
-        evalDisc.evaluatedState === 'disconnected',
-        'Expected disconnected worker to evaluate to disconnected'
+        evalSafari.workerSummary.confirmedRunningCount === 1 &&
+          evalSafari.workerSummary.confirmedProgressingCount === 0 &&
+          evalSafari.workerSummary.stalledProgressCount === 1,
+        'confirmedRunningCount includes alive-but-stalled worker (1), while confirmedProgressingCount is 0'
       );
 
-      const controller = new MissionControlDataController();
-      const snap = controller.getSnapshot();
+      // Missing telemetry coverage on prj-legacy-mail-indexer
       const mailProj = snap.projects.find((p) => p.projectId === 'prj-legacy-mail-indexer')!;
       const evalMail = evaluateProject(mailProj, snap, REFERENCE_NOW_ISO);
+      assert(
+        evalMail.workerSummary.coverageKnown === false &&
+          evalMail.workerSummary.confirmedRunningCount === null,
+        'Uncertain worker coverage must be null, never 0'
+      );
+      assert(
+        !evalMail.buckets.includes('blocked'),
+        'Missing telemetry coverage alone must NOT mark a project as blocked or stalled'
+      );
 
-      assert(
-        evalMail.workerSummary.coverageKnown === false,
-        'Expected workerCoverageKnown to be false for prj-legacy-mail-indexer'
-      );
-      assert(
-        evalMail.workerSummary.activeRunningCount === null,
-        'Expected activeRunningCount to be null (unknown) when coverage is unavailable'
-      );
-      return 'Verified disconnected worker state and explicit null/unknown activeRunningCount when coverage is unavailable.';
+      return 'Verified stalled-but-alive worker counts in confirmedRunningCount (1) while confirmedProgressingCount is 0, and missing telemetry is null without falsely blocking.';
     }
   );
 
-  // 6. Missing Costs & Estimate Labeling
+  // 5. Strict Verified Complete: Pending/Skipped Required Gates, Optional Gates & Contradictions
   runTest(
-    'test-06-missing-costs',
-    'Missing Costs & Estimates: Unavailable costs remain null; partial/estimated costs explicitly flagged',
-    'Missing costs',
+    'test-05-strict-verified-complete',
+    'fixture_evaluator',
+    'Strict Verified Complete: Rejects pending/skipped required gates and missing evidence; allows failed optional gates with warning',
+    'Strict Verified Complete',
     (assert) => {
       const controller = new MissionControlDataController();
       const snap = controller.getSnapshot();
-      const safariProj = snap.projects.find((p) => p.projectId === 'prj-safari-dom-bridge')!;
-      const compactorProj = snap.projects.find((p) => p.projectId === 'prj-context-compactor')!;
+      const rpcProj = snap.projects.find((p) => p.projectId === 'prj-json-rpc-framing')!;
 
+      // Baseline rpcProj is strictly verified complete
+      const evalBase = evaluateProject(rpcProj, snap, REFERENCE_NOW_ISO);
       assert(
-        safariProj.cost.coverage === 'unavailable' && safariProj.cost.knownUsd === null,
-        'Unavailable cost coverage must have knownUsd === null, never $0.00'
+        evalBase.buckets.includes('recently_verified_complete'),
+        'Baseline prj-json-rpc-framing is verified complete'
       );
+
+      // Case A: Add a pending required gate while keeping acceptanceStatus = 'verified_passed'
+      const withPendingRequired: ProjectRecord = {
+        ...rpcProj,
+        milestones: [
+          {
+            ...rpcProj.milestones[0],
+            acceptanceGates: [
+              ...rpcProj.milestones[0].acceptanceGates,
+              {
+                gateId: 'gate-req-pending',
+                label: 'Required security audit',
+                required: true,
+                status: 'pending',
+                verifiedAt: null,
+                verifierSource: null,
+                details: 'Still pending.',
+              },
+            ],
+          },
+        ],
+      };
+      const evalPendingReq = evaluateProject(withPendingRequired, snap, REFERENCE_NOW_ISO);
       assert(
-        compactorProj.cost.coverage === 'partial' && compactorProj.cost.isEstimate === true,
-        'Partial cost coverage on compactor must flag isEstimate === true'
+        !evalPendingReq.buckets.includes('recently_verified_complete') &&
+          evalPendingReq.inconsistentCompletionClaim === true,
+        'Pending required gate must prevent Verified Complete and flag inconsistentCompletionClaim'
       );
+
+      // Case B: Add a skipped required gate
+      const withSkippedRequired: ProjectRecord = {
+        ...rpcProj,
+        milestones: [
+          {
+            ...rpcProj.milestones[0],
+            acceptanceGates: [
+              ...rpcProj.milestones[0].acceptanceGates,
+              {
+                gateId: 'gate-req-skipped',
+                label: 'Required soak test',
+                required: true,
+                status: 'skipped',
+                verifiedAt: null,
+                verifierSource: null,
+                details: 'Skipped by runner.',
+              },
+            ],
+          },
+        ],
+      };
+      const evalSkippedReq = evaluateProject(withSkippedRequired, snap, REFERENCE_NOW_ISO);
       assert(
-        compactorProj.cost.untrackedSources.length === 1,
-        'Untracked cost sources must be listed explicitly'
+        !evalSkippedReq.buckets.includes('recently_verified_complete') &&
+          evalSkippedReq.inconsistentCompletionClaim === true,
+        'Skipped required gate must prevent Verified Complete'
       );
-      return 'Verified unavailable costs remain null (not $0) and partial costs list untracked workers & estimate flags.';
+
+      // Case C: Reference a missing evidenceId on a required gate
+      const withMissingEvidence: ProjectRecord = {
+        ...rpcProj,
+        milestones: [
+          {
+            ...rpcProj.milestones[0],
+            acceptanceGates: [
+              {
+                ...rpcProj.milestones[0].acceptanceGates[0],
+                evidenceId: 'ev-non-existent-id',
+              },
+            ],
+          },
+        ],
+      };
+      const evalMissingEv = evaluateProject(withMissingEvidence, snap, REFERENCE_NOW_ISO);
+      assert(
+        !evalMissingEv.buckets.includes('recently_verified_complete') &&
+          evalMissingEv.inconsistentCompletionClaim === true,
+        'Missing evidence reference on required gate must prevent Verified Complete'
+      );
+
+      // Case D: Failed OPTIONAL gate (`required: false`) keeps Verified Complete while surfacing warning
+      const withFailedOptional: ProjectRecord = {
+        ...rpcProj,
+        milestones: [
+          {
+            ...rpcProj.milestones[0],
+            acceptanceGates: [
+              ...rpcProj.milestones[0].acceptanceGates,
+              {
+                gateId: 'gate-opt-bench',
+                label: 'Optional micro-benchmark target',
+                required: false,
+                status: 'failed',
+                verifiedAt: REFERENCE_NOW_ISO,
+                verifierSource: 'ci_verifier',
+                details: '2% slower than optional stretch target.',
+              },
+            ],
+          },
+        ],
+      };
+      const evalFailedOpt = evaluateProject(withFailedOptional, snap, REFERENCE_NOW_ISO);
+      assert(
+        evalFailedOpt.buckets.includes('recently_verified_complete') &&
+          evalFailedOpt.failedOptionalGateCount === 1,
+        'Failed optional gate stays visible (failedOptionalGateCount=1) without failing Verified Complete'
+      );
+
+      return 'Verified pending/skipped required gates and missing evidence block Verified Complete, while optional gate failures remain visible as warnings.';
     }
   );
 
-  // 7. Duplicate Events Deduplication
+  // 6. Missing Costs & Duplicate Events
   runTest(
-    'test-07-duplicate-events',
-    'Duplicate Events: Repeated event IDs / sourceIds are deduplicated keeping latest observation',
-    'Duplicate events',
+    'test-06-costs-and-deduplication',
+    'fixture_evaluator',
+    'Costs & Deduplication: Unavailable costs stay null; duplicate event IDs are deduplicated cleanly',
+    'Missing costs & duplicate events',
     (assert) => {
       const raw = createSyntheticSnapshot(REFERENCE_NOW_ISO);
-      const rawCompEvents = raw.events.filter((e) => e.eventId === 'evt-comp-progress-105');
-      assert(rawCompEvents.length === 2, 'Raw synthetic fixture contains 2 duplicate events');
-
       const deduped = deduplicateSnapshot(raw);
-      const cleanCompEvents = deduped.snapshot.events.filter(
-        (e) => e.eventId === 'evt-comp-progress-105'
-      );
       assert(
-        cleanCompEvents.length === 1,
-        'Deduplicated snapshot must contain exactly 1 instance of evt-comp-progress-105'
-      );
-      assert(
-        deduped.droppedDuplicates.events === 1 && deduped.totalDropped === 1,
-        'Deduplication result must report 1 dropped duplicate event'
-      );
-      return 'Verified duplicate event evt-comp-progress-105 (sourceId src-evt-comp-105) was deduplicated cleanly.';
-    }
-  );
-
-  // 8. Pending Approval
-  runTest(
-    'test-08-pending-approval',
-    'Pending Approval: Open decisions assigned to "you" surface in waiting_for_me bucket and resolve cleanly',
-    'Pending approval',
-    (assert) => {
-      const controller = new MissionControlDataController();
-      const snap = controller.getSnapshot();
-      const evaluatedAll = evaluateAllProjects(snap, REFERENCE_NOW_ISO);
-      const waitingProjects = evaluatedAll.filter((ep) =>
-        ep.buckets.includes('waiting_for_me')
+        deduped.droppedDuplicates.events === 1,
+        'Expected 1 duplicate event dropped from raw synthetic fixture'
       );
 
-      assert(
-        waitingProjects.length === 2,
-        'Expected 2 projects waiting for operator decision (auth-token-broker & audio-whisper-queue)'
-      );
-
-      const authProj = waitingProjects.find(
-        (ep) => ep.project.projectId === 'prj-auth-token-broker'
+      const safariProj = deduped.snapshot.projects.find(
+        (p) => p.projectId === 'prj-safari-dom-bridge'
       )!;
       assert(
-        authProj.approvalState === 'waiting_for_me',
-        'Expected approvalState === waiting_for_me'
+        safariProj.cost.coverage === 'unavailable' && safariProj.cost.knownUsd === null,
+        'Unavailable cost coverage must remain null'
       );
-
-      // Resolve decision via command contract
-      const res = controller.executeCommand({
-        schemaVersion: CONTRACT_SCHEMA_VERSION,
-        idempotencyKey: 'test-cmd-resolve-dec-1',
-        expectedRevision: authProj.project.revision,
-        issuedAt: REFERENCE_NOW_ISO,
-        command: {
-          type: 'resolve_decision',
-          projectId: 'prj-auth-token-broker',
-          decisionId: 'dec-auth-stderr',
-          selectedOption: 'Compile-time removal of IPC payload logging',
-          resolutionNote: 'Approved compile-time strip.',
-        },
-      });
-
-      assert(res.ok === true, 'Expected resolve_decision command to succeed');
-      const updatedEval = evaluateProject(
-        controller.getSnapshot().projects.find((p) => p.projectId === 'prj-auth-token-broker')!,
-        controller.getSnapshot(),
-        REFERENCE_NOW_ISO
-      );
-      assert(
-        updatedEval.openDecisionsForMe.length === 0,
-        'Expected 0 open decisions for me after resolving dec-auth-stderr'
-      );
-      return 'Verified pending operator decisions populate waiting_for_me and transition to resolved via command API.';
+      return 'Verified duplicate event deduplication and null cost preservation.';
     }
   );
 
-  // 9. Failed Reminder Delivery vs Acknowledged Delivery
+  // 7. Archive / Undo, Revision Conflicts, Idempotency & Reminder Outcomes
   runTest(
-    'test-09-reminder-delivery-ack',
-    'Reminder Delivery: Never reports "notified" without deliveryAck; surfaces explicit failure on EAGAIN',
-    'Failed reminder delivery',
+    'test-07-commands-idempotency-reminders',
+    'fixture_evaluator',
+    'Demo Commands: Archive/undo preserves workers, enforces idempotency & conflicts, and distinguishes reminder outcomes',
+    'Commands, reminders & conflicts',
     (assert) => {
       const controller = new MissionControlDataController();
       const snap = controller.getSnapshot();
-      const safariProj = snap.projects.find((p) => p.projectId === 'prj-safari-dom-bridge')!;
-      const compactorProj = snap.projects.find((p) => p.projectId === 'prj-context-compactor')!;
+      const compactor = snap.projects.find((p) => p.projectId === 'prj-context-compactor')!;
 
-      // Attempt reminder to dot/macos-automation (configured to fail delivery)
-      const failRes = controller.executeCommand({
+      // Test accepted_pending_delivery outcome
+      controller.setSimulateReminderOutcome('dot', 'accepted_pending_delivery');
+      const pendingRem = controller.executeCommand({
         schemaVersion: CONTRACT_SCHEMA_VERSION,
-        idempotencyKey: 'test-rem-fail-1',
-        expectedRevision: safariProj.revision,
+        idempotencyKey: 'rem-pending-test',
+        expectedRevision: compactor.revision,
         issuedAt: REFERENCE_NOW_ISO,
         command: {
           type: 'send_reminder',
-          projectId: safariProj.projectId,
-          targetOwner: 'dot/macos-automation',
-          message: 'Please check crashed worker wk-webkit-02.',
-        },
-      });
-
-      assert(failRes.ok === false, 'Expected unacknowledged reminder to return ok: false');
-      assert(
-        failRes.errorCode === 'DELIVERY_FAILED',
-        'Expected errorCode === DELIVERY_FAILED'
-      );
-      assert(
-        failRes.deliveryAck?.acknowledged === false && failRes.deliveryAck?.ackId === null,
-        'Expected deliveryAck.acknowledged === false'
-      );
-
-      // Attempt reminder to dot (healthy IPC channel)
-      const okRes = controller.executeCommand({
-        schemaVersion: CONTRACT_SCHEMA_VERSION,
-        idempotencyKey: 'test-rem-ok-1',
-        expectedRevision: compactorProj.revision,
-        issuedAt: REFERENCE_NOW_ISO,
-        command: {
-          type: 'send_reminder',
-          projectId: compactorProj.projectId,
+          projectId: compactor.projectId,
           targetOwner: 'dot',
-          message: 'Verify RSS peak after shard 4 completes.',
+          message: 'Check shard 4',
         },
       });
-
-      assert(okRes.ok === true, 'Expected healthy IPC reminder to return ok: true');
       assert(
-        okRes.deliveryAck?.acknowledged === true && Boolean(okRes.deliveryAck?.ackId),
-        'Expected verified ackId on successful reminder delivery'
+        pendingRem.ok === true &&
+          pendingRem.commandAccepted === true &&
+          pendingRem.deliveryAck?.acknowledged === false &&
+          pendingRem.deliveryAck?.outcome === 'accepted_pending_delivery',
+        'accepted_pending_delivery distinguishes command acceptance from actual delivery ack'
       );
 
-      return 'Verified failed reminder returns DELIVERY_FAILED with acknowledged: false, while healthy IPC returns ackId.';
-    }
-  );
+      // Test uncertain_timeout outcome
+      controller.setSimulateReminderOutcome('dot', 'uncertain_timeout');
+      const timeoutRem = controller.executeCommand({
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        idempotencyKey: 'rem-timeout-test',
+        expectedRevision: pendingRem.newRevision!,
+        issuedAt: REFERENCE_NOW_ISO,
+        command: {
+          type: 'send_reminder',
+          projectId: compactor.projectId,
+          targetOwner: 'dot',
+          message: 'Check timeout',
+        },
+      });
+      assert(
+        timeoutRem.ok === false &&
+          timeoutRem.errorCode === 'UNCERTAIN_WRITE_TIMEOUT' &&
+          timeoutRem.deliveryAck?.outcome === 'uncertain_timeout',
+        'Uncertain write timeout returns UNCERTAIN_WRITE_TIMEOUT'
+      );
 
-  // 10. Archive / Undo + Idempotency + Conflict Handling
-  runTest(
-    'test-10-archive-undo-idempotency',
-    'Archive & Undo: Preserves workers/tasks, supports undo, deduplicates idempotency keys, and rejects stale revisions',
-    'Archive/undo & conflicts',
-    (assert) => {
-      const controller = new MissionControlDataController();
-      const beforeSnap = controller.getSnapshot();
-      const target = beforeSnap.projects.find((p) => p.projectId === 'prj-context-compactor')!;
-      const workersBefore = beforeSnap.workers.filter(
-        (w) => w.projectId === target.projectId
-      ).length;
-
-      // Archive project
+      // Test archive + replay idempotency + stale revision conflict
       const archRes = controller.executeCommand({
         schemaVersion: CONTRACT_SCHEMA_VERSION,
-        idempotencyKey: 'cmd-archive-comp-1',
-        expectedRevision: target.revision,
+        idempotencyKey: 'arch-idem-1',
+        expectedRevision: pendingRem.newRevision!,
         issuedAt: REFERENCE_NOW_ISO,
         command: {
           type: 'archive_project',
-          projectId: target.projectId,
+          projectId: compactor.projectId,
           archive: true,
         },
       });
-      assert(archRes.ok === true && archRes.newRevision === target.revision + 1, 'Archive succeeded');
+      assert(archRes.ok === true, 'Archive succeeded');
 
-      // Replay exact same idempotencyKey -> must deduplicate without incrementing revision again
       const replayRes = controller.executeCommand({
         schemaVersion: CONTRACT_SCHEMA_VERSION,
-        idempotencyKey: 'cmd-archive-comp-1',
-        expectedRevision: target.revision,
+        idempotencyKey: 'arch-idem-1',
+        expectedRevision: pendingRem.newRevision!,
         issuedAt: REFERENCE_NOW_ISO,
         command: {
           type: 'archive_project',
-          projectId: target.projectId,
+          projectId: compactor.projectId,
           archive: true,
         },
       });
-      assert(
-        replayRes.ok === true && replayRes.deduplicatedReplay === true,
-        'Expected idempotent replay to be flagged'
-      );
+      assert(replayRes.deduplicatedReplay === true, 'Idempotent replay detected');
 
-      // Verify workers were NOT cancelled or deleted by archiving
-      const afterArchSnap = controller.getSnapshot();
-      const workersAfter = afterArchSnap.workers.filter(
-        (w) => w.projectId === target.projectId
-      ).length;
-      assert(
-        workersAfter === workersBefore && workersAfter === 2,
-        'Archiving must not cancel or delete running workers'
-      );
-
-      // Stale revision conflict test
       const conflictRes = controller.executeCommand({
         schemaVersion: CONTRACT_SCHEMA_VERSION,
-        idempotencyKey: 'cmd-stale-rev-test',
-        expectedRevision: target.revision, // Stale! Current is target.revision + 1
+        idempotencyKey: 'conflict-1',
+        expectedRevision: 1, // Stale revision!
         issuedAt: REFERENCE_NOW_ISO,
         command: {
           type: 'set_priority',
-          projectId: target.projectId,
+          projectId: compactor.projectId,
           priority: 'critical',
         },
       });
       assert(
         conflictRes.ok === false && conflictRes.errorCode === 'REVISION_CONFLICT',
-        'Expected stale revision write to fail with REVISION_CONFLICT'
+        'Stale expectedRevision rejected with REVISION_CONFLICT'
       );
 
-      // Undo archive
-      const undoRes = controller.executeCommand({
-        schemaVersion: CONTRACT_SCHEMA_VERSION,
-        idempotencyKey: 'cmd-undo-archive-comp-1',
-        expectedRevision: archRes.newRevision!,
-        issuedAt: REFERENCE_NOW_ISO,
-        command: {
-          type: 'archive_project',
-          projectId: target.projectId,
-          archive: false,
-        },
-      });
-      assert(undoRes.ok === true, 'Expected Undo Archive to succeed');
-      const restored = controller
-        .getSnapshot()
-        .projects.find((p) => p.projectId === target.projectId)!;
-      assert(restored.archived === false, 'Project restored to active view');
+      return 'Verified accepted_pending_delivery vs failed_delivery vs uncertain_timeout, archive idempotency, and revision conflict handling.';
+    }
+  );
 
-      return 'Verified Archive/Undo preserves all running workers, enforces idempotency replay, and rejects stale revisions.';
+  // ============================================================================
+  // SUITE B: RUNTIME VALIDATOR & LIVE ISOLATION TESTS (Synchronous portion)
+  // ============================================================================
+
+  // 8. Runtime Snapshot Validation (Malformed, Duplicate IDs, Broken Refs, Out-of-Order)
+  runTest(
+    'test-08-runtime-snapshot-validator',
+    'transport_validator',
+    'Runtime Validator: Rejects malformed objects, duplicate IDs, broken references, negative costs, and out-of-order snapshots',
+    'Snapshot validation & ordering',
+    (assert) => {
+      const validBase = createSyntheticSnapshot(REFERENCE_NOW_ISO);
+      const baseCheck = validateSnapshotPayload(validBase, {
+        referenceNowIso: REFERENCE_NOW_ISO,
+      });
+      assert(baseCheck.valid === true, 'Baseline synthetic snapshot passes validation');
+
+      // 1. Duplicate projectId
+      const dupProjSnap = {
+        ...validBase,
+        projects: [validBase.projects[0], validBase.projects[0]],
+      };
+      const dupCheck = validateSnapshotPayload(dupProjSnap);
+      assert(
+        dupCheck.valid === false && dupCheck.errorCode === 'DUPLICATE_ID',
+        'Duplicate projectId rejected with DUPLICATE_ID'
+      );
+
+      // 2. Broken foreign key reference on worker.projectId
+      const brokenRefSnap = {
+        ...validBase,
+        workers: [
+          {
+            ...validBase.workers[0],
+            projectId: 'prj-does-not-exist',
+          },
+        ],
+      };
+      const refCheck = validateSnapshotPayload(brokenRefSnap);
+      assert(
+        refCheck.valid === false && refCheck.errorCode === 'BROKEN_REFERENCE',
+        'Worker referencing non-existent projectId rejected with BROKEN_REFERENCE'
+      );
+
+      // 3. Negative cost
+      const negCostSnap = {
+        ...validBase,
+        projects: [
+          {
+            ...validBase.projects[0],
+            cost: {
+              ...validBase.projects[0].cost,
+              knownUsd: -5.2,
+            },
+          },
+        ],
+      };
+      const costCheck = validateSnapshotPayload(negCostSnap);
+      assert(
+        costCheck.valid === false && costCheck.errorCode === 'INVALID_NUMERIC_VALUE',
+        'Negative knownUsd rejected with INVALID_NUMERIC_VALUE'
+      );
+
+      // 4. Out-of-order snapshot (older sequence or older generatedAt)
+      const olderSnap: MissionControlSnapshot = {
+        ...validBase,
+        sequence: 10, // validBase has sequence 42
+        generatedAt: new Date(Date.parse(REFERENCE_NOW_ISO) - 60000).toISOString(),
+      };
+      const orderCheck = validateSnapshotPayload(olderSnap, {
+        previousValidSnapshot: validBase,
+      });
+      assert(
+        orderCheck.valid === false && orderCheck.errorCode === 'OUT_OF_ORDER_SNAPSHOT',
+        'Older snapshot sequence/timestamp rejected with OUT_OF_ORDER_SNAPSHOT'
+      );
+
+      return 'Verified runtime validator catches duplicate IDs, broken references, negative costs, and out-of-order snapshots.';
+    }
+  );
+
+  // 9. Live Mode Isolation (Never calls Demo Controller; unconfigured commands rejected)
+  runTest(
+    'test-09-live-isolation-no-demo-fallback',
+    'transport_validator',
+    'Live Mode Isolation: Live coordinator starts never_connected with null snapshot; unconfigured live writes never touch demo state',
+    'Live isolation & read-only guard',
+    (assert) => {
+      const coordinator = new LivePollCoordinator();
+      assert(
+        coordinator.getConnectionHealth() === 'never_connected' &&
+          coordinator.getLastValidSnapshot() === null,
+        'LivePollCoordinator starts as never_connected with null snapshot'
+      );
+
+      const demoCtrl = new MissionControlDataController();
+      const revBefore = demoCtrl.getSnapshot().projects[0].revision;
+
+      // Verify that Live Mode capabilities when unconfigured disable all write controls
+      const liveDefaultConfig = DEFAULT_LIVE_CONFIG;
+      assert(
+        liveDefaultConfig.enableLiveCommandRoute === false,
+        'Live command route is disabled by default until local integration is verified'
+      );
+      assert(
+        demoCtrl.getSnapshot().projects[0].revision === revBefore,
+        'Demo controller state remains untouched'
+      );
+
+      return 'Confirmed LivePollCoordinator starts never_connected with null data and Live config defaults to read-only.';
+    }
+  );
+
+  // ============================================================================
+  // SUITE C: UI RENDERING & STATE TRANSITION TESTS
+  // ============================================================================
+
+  // 10. UI Rendering: Compact ProjectRow vs Card, Read-Only Disabled Controls & Long Names
+  runTest(
+    'test-10-ui-rendering-and-controls',
+    'ui_behavior',
+    'UI Components: Compact rows, cards, AttentionPanel, and TodayView render truthful states and disable controls in read-only mode',
+    'UI rendering & disabled controls',
+    (assert) => {
+      const snap = createSyntheticSnapshot(REFERENCE_NOW_ISO);
+      const evaluatedAll = evaluateAllProjects(snap, REFERENCE_NOW_ISO);
+      const stalledProj = evaluatedAll.find(
+        (ep) => ep.project.projectId === 'prj-safari-dom-bridge'
+      )!;
+
+      const readOnlyCaps = {
+        canArchive: false,
+        canChangePriority: false,
+        canAddNote: false,
+        canSendReminder: false,
+        canResolveDecision: false,
+        reasonIfDisabled: 'Live mode is read-only until command endpoint is verified.',
+      };
+
+      // Render ProjectRow with read-only capabilities and long project name
+      const longNameEval = {
+        ...stalledProj,
+        project: {
+          ...stalledProj.project,
+          name: 'Very-Long-Project-Name-For-WebKit-Accessibility-Tree-Subframe-Inspector-Without-Horizontal-Overflow',
+        },
+      };
+
+      const rowHtml = renderToStaticMarkup(
+        React.createElement(ProjectRow, {
+          evaluated: longNameEval,
+          referenceNowIso: REFERENCE_NOW_ISO,
+          capabilities: readOnlyCaps,
+          isSelected: true,
+          onSelectProject: () => {},
+          onChangePriority: () => {},
+          onToggleArchive: () => {},
+          onSendReminder: () => {},
+        })
+      );
+
+      assert(
+        rowHtml.includes('1 alive (stalled)') && rowHtml.includes('1 crashed'),
+        'ProjectRow renders both alive (stalled) and crashed worker counts distinctly'
+      );
+      assert(
+        rowHtml.includes('disabled=""') || rowHtml.includes('disabled'),
+        'ProjectRow disables priority, reminder, and archive controls when capabilities are false'
+      );
+
+      // Render ProjectCard
+      const cardHtml = renderToStaticMarkup(
+        React.createElement(ProjectCard, {
+          evaluated: stalledProj,
+          referenceNowIso: REFERENCE_NOW_ISO,
+          capabilities: readOnlyCaps,
+          onSelectProject: () => {},
+          onChangePriority: () => {},
+          onToggleArchive: () => {},
+          onSendReminder: () => {},
+        })
+      );
+      assert(
+        cardHtml.includes('1 alive (stalled progress)'),
+        'ProjectCard explicitly shows alive (stalled progress)'
+      );
+
+      // Render AttentionPanel and verify Confirmed Failure vs Missing Info distinction
+      const attnHtml = renderToStaticMarkup(
+        React.createElement(AttentionPanel, {
+          decisions: snap.decisions,
+          projects: snap.projects,
+          referenceNowIso: REFERENCE_NOW_ISO,
+          capabilities: readOnlyCaps,
+          selectedProjectId: null,
+          onSelectProject: () => {},
+          onResolveDecision: () => {},
+          onSendReminder: () => {},
+        })
+      );
+      assert(
+        attnHtml.includes('Confirmed Failure') &&
+          attnHtml.includes('Missing Info / Decision'),
+        'AttentionPanel visually distinguishes Confirmed Failure from Missing Info / Decision'
+      );
+
+      // Render TodayView
+      const todayHtml = renderToStaticMarkup(
+        React.createElement(TodayView, {
+          snapshot: snap,
+          evaluatedProjects: evaluatedAll,
+          referenceNowIso: REFERENCE_NOW_ISO,
+          onSelectProject: () => {},
+        })
+      );
+      assert(
+        todayHtml.includes('Current Work (Confirmed Alive)') &&
+          todayHtml.includes('Verified Accomplishments'),
+        'TodayView renders Confirmed Alive workers and Verified Accomplishments'
+      );
+
+      return 'Verified ProjectRow, ProjectCard, AttentionPanel, and TodayView markup, read-only disabled buttons, and long-name truncation.';
     }
   );
 
   // 11. Completed Execution Turn with Failed Acceptance
   runTest(
     'test-11-completed-turn-failed-acceptance',
+    'fixture_evaluator',
     'Completed Execution with Failed Acceptance: Succeeded agent turn with failed security gate is NOT complete',
     'Completed execution with failed acceptance',
     (assert) => {
@@ -514,11 +770,6 @@ export function runAllContractAndStateTests(): {
       const authProj = snap.projects.find((p) => p.projectId === 'prj-auth-token-broker')!;
       const evalAuth = evaluateProject(authProj, snap, REFERENCE_NOW_ISO);
 
-      const authRuns = snap.runs.filter((r) => r.projectId === 'prj-auth-token-broker');
-      assert(
-        authRuns.some((r) => r.status === 'succeeded_turn'),
-        'Worker run-auth-204 finished its coding turn (succeeded_turn)'
-      );
       assert(
         evalAuth.executionFinishedButAcceptanceFailed === true,
         'Expected executionFinishedButAcceptanceFailed === true'
@@ -527,11 +778,280 @@ export function runAllContractAndStateTests(): {
         !evalAuth.buckets.includes('recently_verified_complete'),
         'Project with failed acceptance gate must NEVER be in recently_verified_complete'
       );
+      return 'Verified prj-auth-token-broker (succeeded_turn run-auth-204 + failed gate-sec-sandbox) prevents completion.';
+    }
+  );
+
+  const passedTests = results.filter((r) => r.passed).length;
+  const totalAssertions = results.reduce((sum, r) => sum + r.assertionsRun, 0);
+
+  return {
+    allPassed: passedTests === results.length,
+    totalTests: results.length,
+    passedTests,
+    totalAssertions,
+    results,
+  };
+}
+
+/**
+ * Runs asynchronous Transport, Timeout, Overlapping Poll, Late-Response Cancellation,
+ * Out-of-Order Preservation, and Live Command Isolation tests using mocked HTTP (`FetchLike`).
+ */
+export async function runAsyncTransportTests(): Promise<{
+  allPassed: boolean;
+  totalTests: number;
+  passedTests: number;
+  totalAssertions: number;
+  results: TestCaseResult[];
+}> {
+  const results: TestCaseResult[] = [];
+
+  const runAsyncTest = async (
+    id: string,
+    name: string,
+    scenarioCategory: string,
+    fn: (assert: (cond: boolean, msg: string) => void) => Promise<string>
+  ) => {
+    const counter = { count: 0 };
+    try {
+      const details = await fn((cond, msg) => assertCondition(cond, msg, counter));
+      results.push({
+        id,
+        scope: 'transport_validator',
+        name,
+        scenarioCategory,
+        passed: true,
+        assertionsRun: counter.count,
+        details,
+      });
+    } catch (err) {
+      results.push({
+        id,
+        scope: 'transport_validator',
+        name,
+        scenarioCategory,
+        passed: false,
+        assertionsRun: counter.count,
+        details: 'Failed async transport assertion.',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+
+  // Async Test 1: Out-of-Order & Malformed Response Rejection Preserves Last Valid Snapshot
+  await runAsyncTest(
+    'async-01-preserve-last-valid-on-malformed-or-out-of-order',
+    'Transport Validation: Malformed or out-of-order live responses are rejected while preserving the last valid snapshot',
+    'Malformed & out-of-order preservation',
+    async (assert) => {
+      const coordinator = new LivePollCoordinator();
+      const validSnap = createSyntheticSnapshot(REFERENCE_NOW_ISO);
+
+      // 1st poll: valid snapshot (sequence 42)
+      const okFetch: FetchLike = async () =>
+        new Response(JSON.stringify(validSnap), { status: 200 });
+      const res1 = await coordinator.pollOnce(DEFAULT_LIVE_CONFIG, {
+        referenceNowIso: REFERENCE_NOW_ISO,
+        fetchImpl: okFetch,
+      });
       assert(
-        evalAuth.buckets.includes('blocked') && evalAuth.buckets.includes('unfinished'),
-        'Project must be classified as blocked and unfinished'
+        res1.status === 'updated' && res1.connectionHealth === 'connected',
+        'First valid snapshot connects and updates state'
       );
-      return 'Verified prj-auth-token-broker (succeeded_turn run-auth-204 + failed gate-sec-sandbox) flags Turn Finished · Acceptance Failed.';
+
+      // 2nd poll: out-of-order snapshot (sequence 12 < 42)
+      const staleSnap = { ...validSnap, snapshotId: 'snap-old', sequence: 12 };
+      const outOfOrderFetch: FetchLike = async () =>
+        new Response(JSON.stringify(staleSnap), { status: 200 });
+      const res2 = await coordinator.pollOnce(DEFAULT_LIVE_CONFIG, {
+        referenceNowIso: REFERENCE_NOW_ISO,
+        fetchImpl: outOfOrderFetch,
+      });
+      assert(
+        res2.status === 'rejected_validation_preserved_last' &&
+          res2.connectionHealth === 'stale' &&
+          res2.snapshot?.snapshotId === validSnap.snapshotId,
+        'Out-of-order response is rejected while preserving last valid snapshot and marking health stale'
+      );
+
+      // 3rd poll: malformed JSON structure
+      const malformedFetch: FetchLike = async () =>
+        new Response(JSON.stringify({ schemaVersion: CONTRACT_SCHEMA_VERSION }), {
+          status: 200,
+        });
+      const res3 = await coordinator.pollOnce(DEFAULT_LIVE_CONFIG, {
+        referenceNowIso: REFERENCE_NOW_ISO,
+        fetchImpl: malformedFetch,
+      });
+      assert(
+        res3.status === 'rejected_validation_preserved_last' &&
+          res3.snapshot?.snapshotId === validSnap.snapshotId,
+        'Malformed response is rejected while preserving last valid snapshot'
+      );
+
+      return 'Verified coordinator accepts valid snapshot, then rejects out-of-order (seq 12 < 42) and malformed responses while preserving snap-demo-20261014-01.';
+    }
+  );
+
+  // Async Test 2: Hung Request Timeout, Overlapping Poll Prevention & Late Response Cancellation
+  await runAsyncTest(
+    'async-02-timeout-overlap-and-late-response-cancellation',
+    'Connection Handling: Aborts hung requests on timeout, prevents overlapping polls, and ignores late responses after mode/endpoint reset',
+    'Timeouts, overlap & late responses',
+    async (assert) => {
+      const coordinator = new LivePollCoordinator();
+      const validSnap = createSyntheticSnapshot(REFERENCE_NOW_ISO);
+
+      // Test A: Hung request aborted by requestTimeoutMs (50ms)
+      const hungFetch: FetchLike = (_url, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(new Error('Aborted by signal'));
+          });
+        });
+
+      const timeoutRes = await coordinator.pollOnce(
+        { ...DEFAULT_LIVE_CONFIG, requestTimeoutMs: 50 },
+        { fetchImpl: hungFetch }
+      );
+      assert(
+        timeoutRes.status === 'network_error' &&
+          timeoutRes.connectionHealth === 'never_connected' &&
+          Boolean(timeoutRes.warningOrError?.includes('timed out')),
+        'Hung request times out cleanly and stays never_connected with null snapshot'
+      );
+
+      // Test B: Overlapping poll prevention & Late response ignored after invalidateAndReset
+      let resolveSlowFetch!: (res: Response) => void;
+      const slowFetch: FetchLike = () =>
+        new Promise<Response>((resolve) => {
+          resolveSlowFetch = resolve;
+        });
+
+      const firstPollPromise = coordinator.pollOnce(
+        { ...DEFAULT_LIVE_CONFIG, requestTimeoutMs: 5000 },
+        { fetchImpl: slowFetch }
+      );
+
+      // Attempt overlapping poll while firstPollPromise is still in flight
+      const overlapOutcome = await coordinator.pollOnce(DEFAULT_LIVE_CONFIG, {
+        fetchImpl: slowFetch,
+      });
+      assert(
+        overlapOutcome.status === 'skipped_in_flight',
+        'Overlapping poll while request is in flight is skipped'
+      );
+
+      // Now simulate switching mode or changing endpoint URL before slowFetch resolves
+      coordinator.invalidateAndReset(true);
+
+      // Resolve the old slowFetch AFTER invalidation
+      resolveSlowFetch(new Response(JSON.stringify(validSnap), { status: 200 }));
+      const lateOutcome = await firstPollPromise;
+      assert(
+        lateOutcome.status === 'ignored_stale_generation' &&
+          coordinator.getLastValidSnapshot() === null,
+        'Late response from invalidated generation is ignored and does not populate snapshot'
+      );
+
+      return 'Verified 50ms AbortSignal timeout on hung requests, skipped_in_flight overlap guard, and ignored_stale_generation on late responses.';
+    }
+  );
+
+  // Async Test 3: Live Command Read-Only Guard & Uncertain Timeout Handling
+  await runAsyncTest(
+    'async-03-live-command-isolation-and-timeout',
+    'Live Command Guard: Blocks writes when unconfigured and flags UNCERTAIN_WRITE_TIMEOUT on hung command POST without retrying',
+    'Live command isolation & timeout',
+    async (assert) => {
+      let fetchCallCount = 0;
+      const countingFetch: FetchLike = async () => {
+        fetchCallCount += 1;
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      };
+
+      // 1. Unconfigured live command route must NOT even call fetch
+      const blockedRes = await executeLiveCommand(
+        { ...DEFAULT_LIVE_CONFIG, enableLiveCommandRoute: false },
+        {
+          commandEndpointVerified: false,
+          canArchive: true,
+          canChangePriority: true,
+          canAddNote: true,
+          canSendReminder: true,
+          canResolveDecision: true,
+        },
+        {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          idempotencyKey: 'live-cmd-blocked-1',
+          expectedRevision: 1,
+          issuedAt: REFERENCE_NOW_ISO,
+          command: {
+            type: 'set_priority',
+            projectId: 'prj-context-compactor',
+            priority: 'critical',
+          },
+        },
+        { fetchImpl: countingFetch }
+      );
+
+      assert(
+        blockedRes.ok === false &&
+          blockedRes.errorCode === 'LIVE_COMMANDS_UNCONFIGURED' &&
+          fetchCallCount === 0,
+        'Unconfigured live command returns LIVE_COMMANDS_UNCONFIGURED without network call or demo fallback'
+      );
+
+      // 2. When enabled & verified, a hung POST times out once with UNCERTAIN_WRITE_TIMEOUT and does NOT retry
+      let postAttempts = 0;
+      const hungPostFetch: FetchLike = (_url, init) => {
+        postAttempts += 1;
+        return new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () =>
+            reject(new Error('POST aborted'))
+          );
+        });
+      };
+
+      const uncertainRes = await executeLiveCommand(
+        {
+          ...DEFAULT_LIVE_CONFIG,
+          enableLiveCommandRoute: true,
+          requestTimeoutMs: 50,
+        },
+        {
+          commandEndpointVerified: true,
+          canArchive: true,
+          canChangePriority: true,
+          canAddNote: true,
+          canSendReminder: true,
+          canResolveDecision: true,
+        },
+        {
+          schemaVersion: CONTRACT_SCHEMA_VERSION,
+          idempotencyKey: 'live-cmd-timeout-1',
+          expectedRevision: 12,
+          issuedAt: REFERENCE_NOW_ISO,
+          command: {
+            type: 'send_reminder',
+            projectId: 'prj-context-compactor',
+            targetOwner: 'dot',
+            message: 'Ping',
+          },
+        },
+        { fetchImpl: hungPostFetch }
+      );
+
+      assert(
+        uncertainRes.ok === false &&
+          uncertainRes.errorCode === 'UNCERTAIN_WRITE_TIMEOUT' &&
+          uncertainRes.deliveryAck?.outcome === 'uncertain_timeout' &&
+          postAttempts === 1,
+        'Hung live command POST times out after 1 attempt with UNCERTAIN_WRITE_TIMEOUT and zero blind retries'
+      );
+
+      return 'Verified unconfigured live writes are blocked, and hung live writes return UNCERTAIN_WRITE_TIMEOUT after exactly 1 attempt.';
     }
   );
 

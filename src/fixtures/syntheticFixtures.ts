@@ -1,8 +1,8 @@
 /**
  * @file src/fixtures/syntheticFixtures.ts
- * @description Synthetic fixtures for DEMO MODE and automated scenario verification.
+ * @description Sanitized synthetic fixtures for DEMO MODE and automated scenario verification.
  * All timestamps are generated relative to a reference anchor (`REFERENCE_NOW_ISO`)
- * so that tests and demo views behave deterministically.
+ * so that deterministic fixture tests and interactive demo time-travel behave predictably.
  */
 
 import { CONTRACT_SCHEMA_VERSION, MissionControlSnapshot } from '../schema/contract';
@@ -29,12 +29,15 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
   return {
     schemaVersion: CONTRACT_SCHEMA_VERSION,
     snapshotId: 'snap-demo-20261014-01',
+    sequence: 42,
     generatedAt: nowIso,
     evaluationThresholds: {
       heartbeatExpirySeconds: 90,
       stalledProgressSeconds: 900, // 15 minutes
+      staleFeedWarningSeconds: 30,
     },
     capabilities: {
+      commandEndpointVerified: false, // Synthetic demo mode only
       canArchive: true,
       canChangePriority: true,
       canAddNote: true,
@@ -64,16 +67,17 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         },
         blocker: {
           summary:
-            'Security acceptance gate failed (token leak in debug stderr) + waiting for operator architecture decision.',
+            'Confirmed failure: Security acceptance gate failed (token leak in debug stderr) + waiting for operator architecture decision.',
           since: minutesAgo(18, nowIso),
           kind: 'acceptance_failed',
+          isConfirmedFailure: true,
           owner: 'you',
         },
         acceptanceStatus: 'failed_gates',
         lastVerifiedCompleteAt: null,
         deployedRevision: {
           versionOrSha: 'v0.8.1-rc1 (9a12b4e)',
-          environment: 'local-staging-socket',
+          environment: 'staging-sandbox',
           deployedAt: hoursAgo(6, nowIso),
           verifiedHealthy: true,
         },
@@ -89,8 +93,15 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
             milestoneId: 'ms-auth-1',
             title: 'Keychain XPC & UNIX Socket Framing',
             order: 1,
+            required: true,
             status: 'completed_verified',
             dependsOnMilestoneIds: [],
+            completedSteps: [
+              'Define length-prefixed UNIX domain socket protocol',
+              'Implement Keychain ACL item lookup helper',
+              'Verify framing unit suite (42/42 assertions)',
+            ],
+            currentStep: null,
             remainingSteps: [],
             acceptanceGates: [
               {
@@ -109,8 +120,11 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
             milestoneId: 'ms-auth-2',
             title: 'Zero-Leak Redaction & Least-Privilege Entitlements',
             order: 2,
+            required: true,
             status: 'failed_acceptance',
             dependsOnMilestoneIds: ['ms-auth-1'],
+            completedSteps: ['Drafted IPC debug trace logger and rotation harness'],
+            currentStep: 'Awaiting operator decision on compile-time vs stream redaction',
             remainingSteps: [
               'Resolve operator decision on debug stderr sanitizer vs strict build flag',
               'Re-run leak-detector harness across 500 simulated token rotations',
@@ -142,13 +156,16 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
           },
           {
             milestoneId: 'ms-auth-3',
-            title: 'Mission Control Live Adapter Cutover',
+            title: 'Mission Control Adapter Cutover',
             order: 3,
+            required: true,
             status: 'pending',
             dependsOnMilestoneIds: ['ms-auth-2'],
+            completedSteps: [],
+            currentStep: null,
             remainingSteps: [
-              'Wire live token broker into Mission Control HTTP/SSE adapter',
-              'Run 24h soak test with simulated token expiry',
+              'Wire live token broker into Mission Control HTTP adapter',
+              'Run soak test with simulated token expiry',
             ],
             acceptanceGates: [
               {
@@ -178,6 +195,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
           kind: 'synthetic_demo',
           emitterName: 'demo-fixture-generator',
           observedAt: nowIso,
+          sequence: 7,
         },
       },
       {
@@ -193,7 +211,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
           'Streamline session transcript checkpoints by deduplicating repeated file views and tool outputs while preserving exact line hashes.',
         currentMilestoneId: 'ms-comp-2',
         nextAction:
-          'Complete AST-aware diff folding benchmark on 10k-line TypeScript fixtures (currently executing on 2 workers).',
+          'Complete AST-aware diff folding benchmark on 10k-line TypeScript fixtures (currently executing on 2 confirmed workers).',
         latestUsefulResult: {
           summary:
             'Reduced synthetic replay payload size by 61.4% with zero hash mismatches across 180 test sessions.',
@@ -214,7 +232,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
           coverage: 'partial',
           knownUsd: 1.42,
           isEstimate: true,
-          untrackedSources: ['wk-comp-local-embedder (local CPU worker — uninvoiced)'],
+          untrackedSources: ['wk-comp-local-embedder (local CPU worker — unmetered)'],
           note: 'API token usage metered ($1.42); local quantization pass is untracked.',
         },
         milestones: [
@@ -222,8 +240,14 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
             milestoneId: 'ms-comp-1',
             title: 'Content-Addressable Tool Output Store',
             order: 1,
+            required: true,
             status: 'completed_verified',
             dependsOnMilestoneIds: [],
+            completedSteps: [
+              'Build SHA-256 content-addressable blob index',
+              'Verify bit-for-bit restoration across 10,000 tool outputs',
+            ],
+            currentStep: null,
             remainingSteps: [],
             acceptanceGates: [
               {
@@ -242,8 +266,14 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
             milestoneId: 'ms-comp-2',
             title: 'Deterministic Prompt Checkpoint Folding',
             order: 2,
+            required: true,
             status: 'in_progress',
             dependsOnMilestoneIds: ['ms-comp-1'],
+            completedSteps: [
+              'Implement AST-aware diff folder for TypeScript & JSON',
+              'Complete property-based shards 1 and 2 (135/180 sessions)',
+            ],
+            currentStep: 'Executing property-based corpus shard 3 of 4 & RSS profiling',
             remainingSteps: [
               'Finish property-based corpus run (shard 3 of 4 running)',
               'Verify memory ceiling stays under 250MB RSS',
@@ -251,7 +281,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
             estimateLabel: 'Est. ~15m remaining at current shard throughput (estimate)',
             acceptanceGates: [
               {
-                gateId: 'gate-comp- determinism',
+                gateId: 'gate-comp-determinism',
                 label: 'Byte-identical snapshot reproducibility',
                 required: true,
                 status: 'passed',
@@ -280,8 +310,8 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
             targetOwner: 'dot',
             sentAt: hoursAgo(1, nowIso),
             status: 'acknowledged',
-            deliveryChannel: 'dot-supervisor-ipc',
-            ackId: 'ack-ipc-99201',
+            deliveryChannel: 'synthetic-demo-notifier',
+            ackId: 'ack-demo-99201',
           },
         ],
         source: {
@@ -289,6 +319,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
           kind: 'synthetic_demo',
           emitterName: 'demo-fixture-generator',
           observedAt: nowIso,
+          sequence: 12,
         },
       },
       {
@@ -313,9 +344,10 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         },
         blocker: {
           summary:
-            'wk-webkit-02 crashed (SIGSEGV exit 139); wk-webkit-01 is sending heartbeats but has made zero progress for 48m.',
+            'Confirmed failure: wk-webkit-02 crashed (SIGSEGV exit 139); wk-webkit-01 is alive (sending heartbeats) but has made zero progress for 48m.',
           since: minutesAgo(33, nowIso),
           kind: 'worker_crashed',
+          isConfirmedFailure: true,
           owner: 'dot/macos-automation',
         },
         acceptanceStatus: 'not_run',
@@ -334,8 +366,11 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
             milestoneId: 'ms-ax-1',
             title: 'Non-Activating AXUIElement Traversal',
             order: 1,
+            required: true,
             status: 'blocked',
             dependsOnMilestoneIds: [],
+            completedSteps: ['Query top-level AXWindow and AXWebArea attributes'],
+            currentStep: 'Blocked by detached iframe SIGSEGV & infinite retry loop',
             remainingSteps: [
               'Guard null AXParent reference on destroyed WebKit subframes',
               'Add per-query timeout so worker cannot spin indefinitely with live heartbeat',
@@ -372,6 +407,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
           kind: 'synthetic_demo',
           emitterName: 'demo-fixture-generator',
           observedAt: nowIso,
+          sequence: 4,
         },
       },
       {
@@ -384,10 +420,10 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         archived: false,
         archivedAt: null,
         currentScope:
-          'Watch local voice memo drop-folder, run diarized transcription, and emit structured markdown notes.',
+          'Watch voice memo drop-folder, run diarized transcription, and emit structured markdown notes.',
         currentMilestoneId: 'ms-voice-1',
         nextAction:
-          'Approve speaker-label retention policy and check why worker wk-voice-01 stopped sending heartbeats 11m ago.',
+          'Choose speaker-label retention policy and verify whether worker wk-voice-01 is still running (heartbeat expired 11m ago).',
         latestUsefulResult: {
           summary: 'Drafted WAV chunking pipeline and VAD silence trimmer.',
           observedAt: hoursAgo(2, nowIso),
@@ -395,9 +431,10 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         },
         blocker: {
           summary:
-            'Worker wk-voice-01 heartbeat expired 11m ago + waiting for your decision on speaker audio snippet retention.',
+            'Missing information: Waiting for your decision on speaker audio snippet retention + worker wk-voice-01 heartbeat expired 11m ago (execution state unknown).',
           since: minutesAgo(11, nowIso),
-          kind: 'telemetry_lost',
+          kind: 'decision_needed',
+          isConfirmedFailure: false,
           owner: 'you',
         },
         acceptanceStatus: 'not_run',
@@ -416,8 +453,11 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
             milestoneId: 'ms-voice-1',
             title: 'VAD Chunking & Speaker Diarization Schema',
             order: 1,
+            required: true,
             status: 'blocked',
             dependsOnMilestoneIds: [],
+            completedSteps: ['Implement 30s WAV sliding window chunker'],
+            currentStep: 'Awaiting operator policy decision on biometric speaker embeddings',
             remainingSteps: [
               'Confirm audio snippet retention policy',
               'Verify CoreML diarization accuracy on 5 multi-speaker fixtures',
@@ -430,7 +470,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
                 status: 'pending',
                 verifiedAt: null,
                 verifierSource: null,
-                details: 'Awaiting worker recovery and policy decision.',
+                details: 'Awaiting worker telemetry recovery and policy decision.',
               },
             ],
           },
@@ -442,6 +482,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
           kind: 'synthetic_demo',
           emitterName: 'demo-fixture-generator',
           observedAt: nowIso,
+          sequence: 3,
         },
       },
       {
@@ -457,7 +498,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
           'Port legacy FTS4 query adapter to FTS5 virtual tables without locking read-only SQLite snapshots.',
         currentMilestoneId: 'ms-mail-2',
         nextAction:
-          'Assign a worker to implement incremental rowid watermark sync (currently unstaffed since last week).',
+          'Assign a worker to implement incremental rowid watermark sync (worker telemetry coverage currently unavailable).',
         latestUsefulResult: {
           summary: 'Verified read-only URI connection string prevents WAL journal contention.',
           observedAt: daysAgo(9, nowIso),
@@ -467,7 +508,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         acceptanceStatus: 'not_run',
         lastVerifiedCompleteAt: null,
         deployedRevision: null,
-        workerCoverageKnown: false, // Demonstrates explicit unknown worker coverage!
+        workerCoverageKnown: false, // Missing telemetry alone does NOT mark project stalled/blocked
         cost: {
           coverage: 'partial',
           knownUsd: 0.34,
@@ -480,8 +521,11 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
             milestoneId: 'ms-mail-1',
             title: 'Read-Only SQLite Snapshot Reader',
             order: 1,
+            required: true,
             status: 'completed_verified',
             dependsOnMilestoneIds: [],
+            completedSteps: ['Verify SQLite immutable URI flags under concurrent readers'],
+            currentStep: null,
             remainingSteps: [],
             acceptanceGates: [
               {
@@ -500,8 +544,11 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
             milestoneId: 'ms-mail-2',
             title: 'FTS5 Incremental Watermark Backfill',
             order: 2,
+            required: true,
             status: 'pending',
             dependsOnMilestoneIds: ['ms-mail-1'],
+            completedSteps: [],
+            currentStep: null,
             remainingSteps: [
               'Write watermark state table migration',
               'Add corrupted MIME header fallback parser',
@@ -535,6 +582,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
           kind: 'synthetic_demo',
           emitterName: 'demo-fixture-generator',
           observedAt: nowIso,
+          sequence: 2,
         },
       },
       {
@@ -549,7 +597,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         currentScope:
           'Length-prefixed JSON-RPC transport with backpressure watermarks and deterministic request cancellation.',
         currentMilestoneId: null,
-        nextAction: 'None — all milestones and acceptance gates verified complete.',
+        nextAction: 'None — all required milestones and acceptance gates verified complete.',
         latestUsefulResult: {
           summary:
             'Passed 1M-message fuzz suite and deployed v1.4.2 to local supervisor runtime.',
@@ -568,7 +616,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         workerCoverageKnown: true,
         cost: {
           coverage: 'complete',
-          knownUsd: 3.10,
+          knownUsd: 3.1,
           isEstimate: false,
           untrackedSources: [],
         },
@@ -577,8 +625,15 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
             milestoneId: 'ms-rpc-1',
             title: 'Length-Prefixed Codec & Cancellation Tokens',
             order: 1,
+            required: true,
             status: 'completed_verified',
             dependsOnMilestoneIds: [],
+            completedSteps: [
+              'Implement 4-byte big-endian frame header parser',
+              'Wire AbortController token propagation across RPC streams',
+              'Verify 1M-frame fuzz suite',
+            ],
+            currentStep: null,
             remainingSteps: [],
             acceptanceGates: [
               {
@@ -601,6 +656,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
           kind: 'synthetic_demo',
           emitterName: 'demo-fixture-generator',
           observedAt: nowIso,
+          sequence: 9,
         },
       },
       {
@@ -638,8 +694,11 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
             milestoneId: 'ms-spot-1',
             title: 'CoreSpotlight Attribute Set Mapping',
             order: 1,
+            required: true,
             status: 'pending',
             dependsOnMilestoneIds: [],
+            completedSteps: ['Create initial Info.plist stub'],
+            currentStep: null,
             remainingSteps: [
               'Migrate from deprecated GetMetadataForFile to CSSearchableIndex',
             ],
@@ -663,6 +722,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
           kind: 'synthetic_demo',
           emitterName: 'demo-fixture-generator',
           observedAt: nowIso,
+          sequence: 1,
         },
       },
     ],
@@ -710,7 +770,8 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         status: 'waiting_decision',
         assignedWorkerId: null,
         lastMeaningfulProgressAt: minutesAgo(19, nowIso),
-        summary: 'Code turn completed, but security gate failed; waiting for your redaction policy choice.',
+        summary:
+          'Code turn completed, but security gate failed; waiting for your redaction policy choice.',
         source: {
           sourceId: 'src-tsk-auth-02',
           kind: 'synthetic_demo',
@@ -771,7 +832,8 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         currentTaskSummary: 'Idle — finished agent turn; awaiting decision dec-auth-stderr',
         lastHeartbeatAt: secondsAgo(19, nowIso),
         lastMeaningfulProgressAt: minutesAgo(19, nowIso),
-        lastProgressSummary: 'Completed code turn (run-auth-204); security gate subsequently failed.',
+        lastProgressSummary:
+          'Completed code turn (run-auth-204); security gate subsequently failed.',
         coverageAvailable: true,
         source: {
           sourceId: 'src-wk-auth-01',
@@ -789,7 +851,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         rawStatus: 'running',
         currentRunId: 'run-ax-301',
         currentTaskSummary: 'Querying AXChildren on background window #4',
-        // Heartbeat is fresh (18s ago), but last meaningful progress was 48 minutes ago -> STALLED PROGRESS!
+        // Heartbeat is fresh (18s ago -> ALIVE/RUNNING), but last meaningful progress was 48m ago -> STALLED PROGRESS!
         lastHeartbeatAt: secondsAgo(18, nowIso),
         lastMeaningfulProgressAt: minutesAgo(48, nowIso),
         lastProgressSummary: 'Inspected top-level AXWebArea node; retrying empty child array.',
@@ -828,7 +890,7 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         name: 'dot-worker-voice-01',
         role: 'CoreML Diarization Worker',
         hostLabel: 'synthetic-runner-d (demo)',
-        // Reported 'running', but heartbeat is 11m old (> 90s threshold) -> STALE HEARTBEAT!
+        // Reported 'running', but heartbeat is 11m old (> 90s threshold) without stop proof -> EXECUTION UNKNOWN!
         rawStatus: 'running',
         currentRunId: 'run-voice-401',
         currentTaskSummary: 'Loading whisper-large-v3 CoreML weights',
@@ -899,7 +961,8 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         lastMeaningfulProgressAt: minutesAgo(48, nowIso),
         status: 'stalled',
         turnCount: 3,
-        summary: 'Process alive (heartbeats every 15s), but stuck retrying empty AXChildren array for 48m.',
+        summary:
+          'Process alive (heartbeats every 15s), but stuck retrying empty AXChildren array for 48m.',
         producedEvidenceIds: [],
         source: {
           sourceId: 'src-run-ax-301',
@@ -920,7 +983,8 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         status: 'crashed',
         turnCount: 2,
         summary: 'Terminated abnormally with SIGSEGV (exit 139).',
-        failureDiagnostic: 'EXC_BAD_ACCESS (SIGSEGV) at 0x0000000000000018 in AXUIElementCopyAttributeValue.',
+        failureDiagnostic:
+          'EXC_BAD_ACCESS (SIGSEGV) at 0x0000000000000018 in AXUIElementCopyAttributeValue.',
         producedEvidenceIds: ['ev-ax-crash-log'],
         source: {
           sourceId: 'src-run-ax-302',
@@ -936,9 +1000,10 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         projectId: 'prj-auth-token-broker',
         milestoneId: 'ms-auth-2',
         kind: 'failure_intervention',
+        severity: 'confirmed_failure',
         status: 'open',
         exactPromptOrFailure:
-          'Security gate `gate-sec-sandbox` failed: Bearer token prefix leaked to stderr when `DOT_DEBUG_IPC=1` is enabled. Should `dot` strip `DOT_DEBUG_IPC` payload logging at compile time or install a regex redaction filter on stderr?',
+          'Confirmed Failure — Security gate `gate-sec-sandbox` failed: Bearer token prefix leaked to stderr when `DOT_DEBUG_IPC=1` is enabled. Should `dot` strip `DOT_DEBUG_IPC` payload logging at compile time or install a regex redaction filter on stderr?',
         contextSummary:
           'Worker wk-auth-01 completed its coding turn (commit 4c91e0b), but the project cannot advance until you choose the security remediation approach.',
         createdAt: minutesAgo(18, nowIso),
@@ -961,12 +1026,13 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         decisionId: 'dec-voice-retention',
         projectId: 'prj-audio-whisper-queue',
         milestoneId: 'ms-voice-1',
-        kind: 'question_for_me',
+        kind: 'missing_information',
+        severity: 'missing_info_or_decision',
         status: 'open',
         exactPromptOrFailure:
-          'Should unknown speaker diarization embeddings be persisted across voice memos or discarded immediately after markdown export?',
+          'Missing Information — Should unknown speaker diarization embeddings be persisted across voice memos or discarded immediately after markdown export?',
         contextSummary:
-          'Persisting speaker embeddings enables cross-memo speaker labeling, but stores biometric voiceprint vectors on disk.',
+          'Persisting speaker embeddings enables cross-memo speaker labeling, but stores biometric voiceprint vectors on disk. Also note: worker wk-voice-01 heartbeat expired 11m ago.',
         createdAt: hoursAgo(2, nowIso),
         owner: 'you',
         recommendedNextStep:
@@ -983,13 +1049,14 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         },
       },
       {
-        decisionId: 'dec-ax-Crash',
+        decisionId: 'dec-ax-crash',
         projectId: 'prj-safari-dom-bridge',
         milestoneId: 'ms-ax-1',
         kind: 'failure_intervention',
+        severity: 'confirmed_failure',
         status: 'open',
         exactPromptOrFailure:
-          'Worker `wk-webkit-02` crashed with SIGSEGV (exit 139) on detached iframe, and `wk-webkit-01` has stalled for 48m with no progress despite fresh heartbeats.',
+          'Confirmed Failure — Worker `wk-webkit-02` crashed with SIGSEGV (exit 139) on detached iframe, and `wk-webkit-01` has stalled for 48m with no progress despite fresh heartbeats.',
         contextSummary:
           'Owned by `dot/macos-automation`. Reminder delivery via macos-automation-bridge failed 12m ago (EAGAIN).',
         createdAt: minutesAgo(33, nowIso),
@@ -1045,6 +1112,23 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         },
       },
       {
+        evidenceId: 'ev-comp-sha',
+        projectId: 'prj-context-compactor',
+        kind: 'test_report',
+        label: 'SHA-256 Roundtrip Store Verification',
+        uriOrRef: 'artifacts://dot-bench/compactor/sha256-roundtrip.tap',
+        verified: true,
+        createdAt: hoursAgo(5, nowIso),
+        summary: '10,000 tool outputs compressed and restored bit-for-bit.',
+        metricsSummary: '10,000 passed · 0 mismatches',
+        source: {
+          sourceId: 'src-ev-comp-sha',
+          kind: 'ci_verifier',
+          emitterName: 'dot-bench-harness',
+          observedAt: hoursAgo(5, nowIso),
+        },
+      },
+      {
         evidenceId: 'ev-comp-bench',
         projectId: 'prj-context-compactor',
         kind: 'artifact_bundle',
@@ -1052,7 +1136,8 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         uriOrRef: 'artifacts://dot-bench/compactor/shard-1-3-summary.json',
         verified: true,
         createdAt: minutesAgo(2, nowIso),
-        summary: '61.4% token reduction across 180 transcripts with 100% SHA-256 restore fidelity.',
+        summary:
+          '61.4% token reduction across 180 transcripts with 100% SHA-256 restore fidelity.',
         metricsSummary: '-61.4% tokens · 0 hash mismatches',
         source: {
           sourceId: 'src-ev-comp-bench',
@@ -1069,7 +1154,8 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         uriOrRef: 'logs://crash-reporter/dot-worker-webkit-02-2026-10-14.ips',
         verified: true,
         createdAt: minutesAgo(33, nowIso),
-        summary: 'Thread 0 crashed in HIServices`AXUIElementCopyAttributeValue + 44 (null Mach port).',
+        summary:
+          'Thread 0 crashed in HIServices`AXUIElementCopyAttributeValue + 44 (null Mach port).',
         metricsSummary: 'Signal 11 (SIGSEGV) · Exit 139',
         source: {
           sourceId: 'src-ev-ax-crash',
@@ -1121,7 +1207,8 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         category: 'progress',
         actor: 'dot-worker-comp-01',
         title: 'Verified 15 additional transcript checkpoints (135/180)',
-        detail: 'Shard 3 folding pass achieved 61.4% compression with exact line-hash restoration.',
+        detail:
+          'Shard 3 folding pass achieved 61.4% compression with exact line-hash restoration.',
         isMeaningfulProgress: true,
         source: {
           sourceId: 'src-evt-comp-105',
@@ -1154,7 +1241,8 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         category: 'heartbeat',
         actor: 'dot-worker-webkit-01',
         title: 'Worker heartbeat received (PID 48219 alive, 0 new nodes)',
-        detail: 'Heartbeat proves process liveness only; worker remains stuck on empty AXChildren query (48m since last progress).',
+        detail:
+          'Heartbeat proves process liveness only; worker remains stuck on empty AXChildren query (48m since last progress).',
         isMeaningfulProgress: false,
         source: {
           sourceId: 'src-evt-ax-hb-99',
@@ -1170,7 +1258,8 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         category: 'gate_result',
         actor: 'local-sec-scanner',
         title: 'Acceptance gate `gate-sec-sandbox` FAILED after agent turn finished',
-        detail: 'Agent turn run-auth-204 succeeded, but stderr secret scanner caught bearer prefix under DOT_DEBUG_IPC=1.',
+        detail:
+          'Agent turn run-auth-204 succeeded, but stderr secret scanner caught bearer prefix under DOT_DEBUG_IPC=1.',
         isMeaningfulProgress: true,
         source: {
           sourceId: 'src-evt-auth-gate-fail',
@@ -1186,7 +1275,8 @@ export function createSyntheticSnapshot(nowIso = REFERENCE_NOW_ISO): MissionCont
         category: 'worker_crash',
         actor: 'dot-worker-webkit-02',
         title: 'Worker crashed with SIGSEGV (exit code 139)',
-        detail: 'Null Mach port dereference in AXUIElementCopyAttributeValue on detached iframe.',
+        detail:
+          'Null Mach port dereference in AXUIElementCopyAttributeValue on detached iframe.',
         isMeaningfulProgress: false,
         source: {
           sourceId: 'src-evt-ax-crash',

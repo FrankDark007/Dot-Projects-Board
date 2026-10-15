@@ -1,11 +1,18 @@
 /**
  * @file src/components/AttentionPanel.tsx
- * @description Prominent Attention Panel displaying exact questions or failures,
- * their age, responsible owner, recommended next step, and direct resolution controls.
+ * @description Prominent Attention Panel displaying exact problems, age, owner, and next useful action.
+ * Explicitly separates Confirmed Failures (red) from Missing Information / Pending Decisions (amber).
  */
 
 import React, { useState } from 'react';
-import { AlertTriangle, ArrowUpRight, CheckCircle2, Clock, HelpCircle, ShieldAlert } from 'lucide-react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Clock,
+  HelpCircle,
+  PanelRightOpen,
+  ShieldAlert,
+} from 'lucide-react';
 import { BackendCapabilities, DecisionRequest, ProjectRecord } from '../schema/contract';
 import { formatRelativeAge } from '../utils/timeFormat';
 
@@ -14,6 +21,7 @@ interface AttentionPanelProps {
   projects: ProjectRecord[];
   referenceNowIso: string;
   capabilities: BackendCapabilities;
+  selectedProjectId: string | null;
   onSelectProject: (projectId: string) => void;
   onResolveDecision: (
     projectId: string,
@@ -29,6 +37,7 @@ export const AttentionPanel: React.FC<AttentionPanelProps> = ({
   projects,
   referenceNowIso,
   capabilities,
+  selectedProjectId,
   onSelectProject,
   onResolveDecision,
   onSendReminder,
@@ -37,128 +46,180 @@ export const AttentionPanel: React.FC<AttentionPanelProps> = ({
   const [customNotes, setCustomNotes] = useState<Record<string, string>>({});
 
   const openDecisions = decisions.filter((d) => d.status === 'open');
+
   if (openDecisions.length === 0) {
     return (
       <section
         aria-label="Attention Required"
-        className="bg-white border border-slate-200 rounded-xl p-5 mb-6"
+        className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg px-4 py-3.5 mb-6"
       >
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <CheckCircle2 className="w-5 h-5 text-emerald-700 shrink-0" />
-            <div>
-              <h2 className="text-base font-semibold text-slate-900">
-                No Immediate Operator Decisions Pending
-              </h2>
-              <p className="text-sm text-slate-600">
-                All active questions and failure interventions have been addressed.
-              </p>
-            </div>
+        <div className="flex items-center gap-3">
+          <CheckCircle2 className="w-4 h-4 text-teal-600 dark:text-teal-400 shrink-0" />
+          <div className="text-xs">
+            <span className="font-semibold text-slate-900 dark:text-slate-100">
+              No Unresolved Attention Items
+            </span>
+            <span className="text-slate-500 dark:text-slate-400 ml-2">
+              All confirmed failures and operator questions have been addressed.
+            </span>
           </div>
         </div>
       </section>
     );
   }
 
-  // Sort decisions where owner === 'you' first, then by age
+  // Classify Confirmed Failures vs Missing Info / Decisions
+  const isConfirmedFailure = (d: DecisionRequest) =>
+    d.severity === 'confirmed_failure' || d.kind === 'failure_intervention';
+
+  const confirmedFailureCount = openDecisions.filter(isConfirmedFailure).length;
+  const missingInfoCount = openDecisions.length - confirmedFailureCount;
+
+  // Sort: owner === 'you' first, then confirmed failures first, then oldest first
   const sortedDecisions = [...openDecisions].sort((a, b) => {
     const aIsYou = a.owner.toLowerCase() === 'you' ? 0 : 1;
     const bIsYou = b.owner.toLowerCase() === 'you' ? 0 : 1;
     if (aIsYou !== bIsYou) return aIsYou - bIsYou;
+    const aFail = isConfirmedFailure(a) ? 0 : 1;
+    const bFail = isConfirmedFailure(b) ? 0 : 1;
+    if (aFail !== bFail) return aFail - bFail;
     return Date.parse(a.createdAt) - Date.parse(b.createdAt);
   });
 
   return (
     <section
       aria-label="Attention Required"
-      className="bg-white border border-slate-300 rounded-xl p-6 mb-8"
+      className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg mb-6 overflow-hidden"
     >
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-4 mb-5 border-b border-slate-200">
-        <div>
-          <div className="flex items-center gap-2 text-xs font-medium text-amber-800 mb-1">
-            <AlertTriangle className="w-4 h-4 text-amber-700 shrink-0" />
-            <span>Attention Queue</span>
-            <span aria-hidden="true">·</span>
-            <span className="font-mono tabular-nums">{sortedDecisions.length} unresolved</span>
-          </div>
-          <h2 className="text-lg font-semibold text-slate-900">
-            Questions, Acceptance Failures & Crashed Runs Needing Action
-          </h2>
+      {/* Header Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3 border-b border-slate-200 dark:border-slate-800 bg-slate-50/70 dark:bg-slate-900/60">
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <span className="font-semibold text-slate-900 dark:text-slate-100">
+            Attention Needed First
+          </span>
+          <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
+            ·
+          </span>
+          {confirmedFailureCount > 0 && (
+            <span className="inline-flex items-center gap-1 font-medium text-red-700 dark:text-red-400">
+              <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
+              <span className="font-mono tabular-nums">{confirmedFailureCount}</span>
+              <span>confirmed {confirmedFailureCount === 1 ? 'failure' : 'failures'}</span>
+            </span>
+          )}
+          {confirmedFailureCount > 0 && missingInfoCount > 0 && (
+            <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
+              ·
+            </span>
+          )}
+          {missingInfoCount > 0 && (
+            <span className="inline-flex items-center gap-1 font-medium text-amber-800 dark:text-amber-400">
+              <HelpCircle className="w-3.5 h-3.5 shrink-0" />
+              <span className="font-mono tabular-nums">{missingInfoCount}</span>
+              <span>missing info / decision needed</span>
+            </span>
+          )}
         </div>
-        <p className="text-xs text-slate-500">
-          Exact prompts and failure diagnostics from verified subsystem sources
-        </p>
+        <span className="text-[11px] text-slate-500 dark:text-slate-400">
+          Confirmed failures (red) are distinct from missing information or policy questions (amber)
+        </span>
       </div>
 
-      <div className="divide-y divide-slate-200">
+      {/* Items List */}
+      <div className="divide-y divide-slate-200 dark:divide-slate-800">
         {sortedDecisions.map((dec) => {
           const project = projects.find((p) => p.projectId === dec.projectId);
           const isForMe = dec.owner.toLowerCase() === 'you';
+          const confirmedFail = isConfirmedFailure(dec);
           const chosenOption =
             selectedOptions[dec.decisionId] ?? (dec.options ? dec.options[0] : '');
           const noteText = customNotes[dec.decisionId] ?? '';
+          const isProjectSelected = selectedProjectId === dec.projectId;
 
           return (
-            <div key={dec.decisionId} className="py-5 first:pt-0 last:pb-0">
-              <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-6">
+            <div
+              key={dec.decisionId}
+              className={`p-4 transition-colors ${
+                isProjectSelected
+                  ? 'bg-sky-50/40 dark:bg-sky-950/20'
+                  : 'hover:bg-slate-50/50 dark:hover:bg-slate-900/30'
+              }`}
+            >
+              <div className="flex flex-col xl:flex-row xl:items-start justify-between gap-4">
                 <div className="flex-1 min-w-0">
-                  {/* Metadata Line (Zero-Pill Discipline: clean unboxed text with separators) */}
-                  <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600 mb-2">
-                    <span className="font-semibold text-slate-900">
-                      {project ? project.name : dec.projectId}
+                  {/* Unboxed Metadata Line */}
+                  <div className="flex flex-wrap items-center gap-2 text-xs mb-1.5">
+                    {confirmedFail ? (
+                      <span className="inline-flex items-center gap-1 font-semibold text-red-700 dark:text-red-400">
+                        <ShieldAlert className="w-3.5 h-3.5 shrink-0" />
+                        <span>Confirmed Failure</span>
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 font-semibold text-amber-800 dark:text-amber-400">
+                        <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                        <span>Missing Info / Decision</span>
+                      </span>
+                    )}
+                    <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
+                      ·
                     </span>
-                    <span aria-hidden="true">·</span>
+                    <button
+                      type="button"
+                      onClick={() => onSelectProject(dec.projectId)}
+                      className="font-semibold text-slate-900 dark:text-slate-100 hover:underline underline-offset-4 text-left cursor-pointer truncate max-w-xs sm:max-w-md"
+                    >
+                      {project ? project.name : dec.projectId}
+                    </button>
+                    <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
+                      ·
+                    </span>
                     <span
                       className={
                         isForMe
-                          ? 'font-semibold text-amber-800'
-                          : 'font-medium text-slate-700'
+                          ? 'font-semibold text-amber-800 dark:text-amber-300'
+                          : 'text-slate-600 dark:text-slate-400'
                       }
                     >
                       Owner: {dec.owner}
                     </span>
-                    <span aria-hidden="true">·</span>
-                    <span className="inline-flex items-center gap-1 font-mono tabular-nums text-slate-600">
-                      <Clock className="w-3.5 h-3.5 text-slate-400" />
-                      Age: {formatRelativeAge(dec.createdAt, referenceNowIso)}
+                    <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
+                      ·
                     </span>
-                    <span aria-hidden="true">·</span>
-                    <span className="font-mono text-slate-500">{dec.decisionId}</span>
+                    <span className="inline-flex items-center gap-1 font-mono tabular-nums text-slate-500 dark:text-slate-400">
+                      <Clock className="w-3 h-3" />
+                      {formatRelativeAge(dec.createdAt, referenceNowIso)}
+                    </span>
                   </div>
 
-                  {/* Exact Question or Failure */}
-                  <div className="flex items-start gap-2.5 mb-2">
-                    {dec.kind === 'failure_intervention' ? (
-                      <ShieldAlert className="w-4 h-4 text-red-700 shrink-0 mt-1" />
-                    ) : (
-                      <HelpCircle className="w-4 h-4 text-amber-700 shrink-0 mt-1" />
-                    )}
-                    <p className="text-sm font-semibold text-slate-900 leading-snug">
-                      {dec.exactPromptOrFailure}
-                    </p>
-                  </div>
+                  {/* Exact Problem */}
+                  <p className="text-sm font-semibold text-slate-900 dark:text-slate-100 leading-snug mb-1">
+                    {dec.exactPromptOrFailure}
+                  </p>
+                  <p className="text-xs text-slate-600 dark:text-slate-400 mb-2">
+                    {dec.contextSummary}
+                  </p>
 
-                  <p className="text-xs text-slate-600 mb-3 pl-6.5">{dec.contextSummary}</p>
-
-                  {/* Recommended Next Step */}
-                  <div className="pl-6.5 text-xs text-slate-700">
-                    <span className="font-semibold text-slate-900">Next step: </span>
+                  {/* Next Useful Action */}
+                  <div className="text-xs text-slate-700 dark:text-slate-300">
+                    <span className="font-semibold text-slate-900 dark:text-slate-100">
+                      Next useful action:{' '}
+                    </span>
                     <span>{dec.recommendedNextStep}</span>
                   </div>
                 </div>
 
-                {/* Right Column: Action Controls */}
-                <div className="w-full lg:w-96 shrink-0 bg-slate-50 border border-slate-200 rounded-lg p-3.5">
+                {/* Action Controls */}
+                <div className="w-full xl:w-96 shrink-0 flex flex-col gap-2 bg-slate-50 dark:bg-slate-900/70 border border-slate-200 dark:border-slate-800 rounded-md p-3">
                   {dec.options && dec.options.length > 0 && (
-                    <div className="mb-2.5">
+                    <div>
                       <label
-                        htmlFor={`select-${dec.decisionId}`}
-                        className="block text-xs font-medium text-slate-700 mb-1"
+                        htmlFor={`attn-opt-${dec.decisionId}`}
+                        className="sr-only"
                       >
-                        Select decision / remediation path
+                        Select decision option
                       </label>
                       <select
-                        id={`select-${dec.decisionId}`}
+                        id={`attn-opt-${dec.decisionId}`}
                         value={chosenOption}
                         disabled={!capabilities.canResolveDecision}
                         onChange={(e) =>
@@ -167,7 +228,7 @@ export const AttentionPanel: React.FC<AttentionPanelProps> = ({
                             [dec.decisionId]: e.target.value,
                           }))
                         }
-                        className="w-full text-xs bg-white border border-slate-300 rounded-md px-2.5 py-1.5 text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900 disabled:opacity-50"
+                        className="w-full text-xs bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1.5 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-600 disabled:opacity-50"
                       >
                         {dec.options.map((opt) => (
                           <option key={opt} value={opt}>
@@ -178,10 +239,10 @@ export const AttentionPanel: React.FC<AttentionPanelProps> = ({
                     </div>
                   )}
 
-                  <div className="mb-3">
+                  <div className="flex items-center gap-2">
                     <input
                       type="text"
-                      placeholder="Optional operator note or instruction..."
+                      placeholder="Optional resolution note..."
                       value={noteText}
                       disabled={!capabilities.canResolveDecision}
                       onChange={(e) =>
@@ -191,11 +252,11 @@ export const AttentionPanel: React.FC<AttentionPanelProps> = ({
                         }))
                       }
                       aria-label="Resolution note"
-                      className="w-full text-xs bg-white border border-slate-300 rounded-md px-2.5 py-1.5 text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-slate-900 disabled:opacity-50"
+                      className="flex-1 min-w-0 text-xs bg-white dark:bg-slate-950 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1.5 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-600 disabled:opacity-50"
                     />
                   </div>
 
-                  <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
                     <div className="flex items-center gap-2">
                       <button
                         type="button"
@@ -203,20 +264,20 @@ export const AttentionPanel: React.FC<AttentionPanelProps> = ({
                         title={
                           !capabilities.canResolveDecision
                             ? capabilities.reasonIfDisabled ||
-                              'Backend does not support decision resolution'
-                            : 'Record decision and unblock next step'
+                              'Disabled until backend command route is verified'
+                            : 'Record decision'
                         }
                         onClick={() =>
                           onResolveDecision(
                             dec.projectId,
                             dec.decisionId,
                             chosenOption || undefined,
-                            noteText || 'Approved via Attention Panel'
+                            noteText || 'Resolved via Attention Panel'
                           )
                         }
-                        className="px-3 py-1.5 text-xs font-medium text-white bg-slate-900 rounded-md hover:bg-slate-800 transition-colors disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap shrink-0 cursor-pointer"
+                        className="px-3 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded transition-colors disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap shrink-0 cursor-pointer"
                       >
-                        Record Decision
+                        Resolve
                       </button>
 
                       {!isForMe && (
@@ -225,9 +286,8 @@ export const AttentionPanel: React.FC<AttentionPanelProps> = ({
                           disabled={!capabilities.canSendReminder}
                           title={
                             !capabilities.canSendReminder
-                              ? capabilities.reasonIfDisabled ||
-                                'Backend does not support reminders'
-                              : `Send reminder to ${dec.owner} (requires delivery ack)`
+                              ? capabilities.reasonIfDisabled || 'Reminders disabled'
+                              : `Send reminder to ${dec.owner}`
                           }
                           onClick={() =>
                             onSendReminder(
@@ -236,7 +296,7 @@ export const AttentionPanel: React.FC<AttentionPanelProps> = ({
                               `Attention needed on ${dec.decisionId}: ${dec.recommendedNextStep}`
                             )
                           }
-                          className="px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-md hover:bg-slate-100 transition-colors disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap shrink-0 cursor-pointer"
+                          className="px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap shrink-0 cursor-pointer"
                         >
                           Remind {dec.owner}
                         </button>
@@ -246,16 +306,16 @@ export const AttentionPanel: React.FC<AttentionPanelProps> = ({
                     <button
                       type="button"
                       onClick={() => onSelectProject(dec.projectId)}
-                      className="inline-flex items-center gap-1 text-xs font-medium text-slate-700 hover:text-slate-900 underline-offset-4 hover:underline whitespace-nowrap shrink-0 cursor-pointer"
+                      className="inline-flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white whitespace-nowrap shrink-0 cursor-pointer"
                     >
-                      <span>Inspect Project</span>
-                      <ArrowUpRight className="w-3.5 h-3.5" />
+                      <PanelRightOpen className="w-3.5 h-3.5" />
+                      <span>Open Panel</span>
                     </button>
                   </div>
 
                   {!capabilities.canResolveDecision && (
-                    <p className="mt-2 text-[11px] text-amber-800">
-                      Disabled: {capabilities.reasonIfDisabled || 'Live adapter is not connected.'}
+                    <p className="text-[11px] text-amber-800 dark:text-amber-400">
+                      Read-only: {capabilities.reasonIfDisabled || 'Live commands unconfigured.'}
                     </p>
                   )}
                 </div>

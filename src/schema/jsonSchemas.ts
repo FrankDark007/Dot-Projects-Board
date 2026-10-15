@@ -1,6 +1,8 @@
 /**
  * @file src/schema/jsonSchemas.ts
- * @description Formal JSON Schema definitions and example payloads for Snapshot, Event Stream, and Command APIs.
+ * @description Formal JSON Schema definitions and example payloads for Snapshot and Future Command APIs.
+ * Note: These are proposed integration contracts for the existing local Mission Control / projectBoard
+ * backend, not claims of already-deployed live endpoints or IPC sockets.
  */
 
 import { CONTRACT_SCHEMA_VERSION } from './contract';
@@ -27,6 +29,11 @@ export const SNAPSHOT_JSON_SCHEMA = {
   properties: {
     schemaVersion: { const: CONTRACT_SCHEMA_VERSION },
     snapshotId: { type: 'string', minLength: 1 },
+    sequence: {
+      type: 'integer',
+      minimum: 0,
+      description: 'Optional monotonic sequence number per source emitter for out-of-order rejection.',
+    },
     generatedAt: { type: 'string', format: 'date-time' },
     evaluationThresholds: {
       type: 'object',
@@ -34,6 +41,7 @@ export const SNAPSHOT_JSON_SCHEMA = {
       properties: {
         heartbeatExpirySeconds: { type: 'integer', minimum: 10 },
         stalledProgressSeconds: { type: 'integer', minimum: 30 },
+        staleFeedWarningSeconds: { type: 'integer', minimum: 10 },
       },
     },
     capabilities: {
@@ -46,6 +54,7 @@ export const SNAPSHOT_JSON_SCHEMA = {
         'canResolveDecision',
       ],
       properties: {
+        commandEndpointVerified: { type: 'boolean' },
         canArchive: { type: 'boolean' },
         canChangePriority: { type: 'boolean' },
         canAddNote: { type: 'boolean' },
@@ -80,6 +89,7 @@ export const SNAPSHOT_JSON_SCHEMA = {
         },
         emitterName: { type: 'string' },
         observedAt: { type: 'string', format: 'date-time' },
+        sequence: { type: 'integer', minimum: 0 },
       },
     },
     ProjectRecord: {
@@ -136,7 +146,16 @@ export const SNAPSHOT_JSON_SCHEMA = {
     },
     EvidenceLink: {
       type: 'object',
-      required: ['evidenceId', 'projectId', 'kind', 'label', 'uriOrRef', 'verified', 'createdAt', 'source'],
+      required: [
+        'evidenceId',
+        'projectId',
+        'kind',
+        'label',
+        'uriOrRef',
+        'verified',
+        'createdAt',
+        'source',
+      ],
     },
     ActivityEvent: {
       type: 'object',
@@ -164,12 +183,14 @@ export const COMMAND_REQUEST_JSON_SCHEMA = {
     schemaVersion: { const: CONTRACT_SCHEMA_VERSION },
     idempotencyKey: {
       type: 'string',
-      description: 'UUID or deterministic client key preventing duplicate writes on retry.',
+      description:
+        'Client-generated key preventing duplicate mutations. If a write times out, the client must refresh the snapshot before deciding whether to replay this key.',
     },
     expectedRevision: {
       type: 'integer',
       minimum: 1,
-      description: 'Project revision expected by operator UI. Rejects with 409 REVISION_CONFLICT if stale.',
+      description:
+        'Project revision expected by operator UI. Rejects with 409 REVISION_CONFLICT if stale.',
     },
     issuedAt: { type: 'string', format: 'date-time' },
     command: {
@@ -196,30 +217,21 @@ export const CONTRACT_DOCUMENTATION_EXAMPLES = {
     {
       method: 'GET',
       path: '/api/mission-control/v1/snapshot',
+      status: 'Proposed Read Adapter Endpoint',
       description:
-        'Returns a point-in-time MissionControlSnapshot. Supports If-None-Match (ETag) and bounded polling with exponential backoff and background-tab throttling.',
+        'Returns a point-in-time MissionControlSnapshot validated at runtime (`validateSnapshotPayload`). Supports bounded polling with AbortSignal timeout, exponential backoff, and background-tab throttling.',
       headers: {
-        Authorization: 'Bearer <local-session-token>',
         Accept: 'application/json',
-      },
-    },
-    {
-      method: 'GET (SSE)',
-      path: '/api/mission-control/v1/events?sinceEventId=<last_event_id>',
-      description:
-        'Optional single Server-Sent Events stream emitting deduplicated ActivityEvent and WorkerRecord deltas. Reconnects with Last-Event-ID.',
-      headers: {
-        Authorization: 'Bearer <local-session-token>',
-        Accept: 'text/event-stream',
+        'X-Mission-Control-Schema': CONTRACT_SCHEMA_VERSION,
       },
     },
     {
       method: 'POST',
       path: '/api/mission-control/v1/commands',
+      status: 'Proposed Future Write Contract (Disabled in Live Mode Until Verified)',
       description:
-        'Executes an operator control action (archive/undo, priority change, note, owner reminder, decision resolution) with idempotency and revision conflict checks.',
+        'Executes an operator mutation with idempotency key and expectedRevision. Distinguishes commandAccepted (persisted in projectBoard) from deliveryAck (whether downstream owner notification actually succeeded).',
       headers: {
-        Authorization: 'Bearer <local-session-token>',
         'Content-Type': 'application/json',
         'Idempotency-Key': 'cmd-2026-10-14-98f1a2',
       },
@@ -229,22 +241,56 @@ export const CONTRACT_DOCUMENTATION_EXAMPLES = {
     revisionConflict409: {
       ok: false,
       idempotencyKey: 'cmd-2026-10-14-98f1a2',
+      commandAccepted: false,
       errorCode: 'REVISION_CONFLICT',
       errorMessage:
-        'Project prj-dot-router was updated to revision 14 by dot-supervisor. Refresh snapshot before applying priority change.',
+        'Project prj-auth-token-broker was updated to revision 8 by another process. Refresh snapshot before applying priority change.',
+    },
+    acceptedButDeliveryPending202: {
+      ok: true,
+      idempotencyKey: 'cmd-2026-10-14-44a8c1',
+      commandAccepted: true,
+      newRevision: 13,
+      deliveryAck: {
+        acknowledged: false,
+        outcome: 'accepted_pending_delivery',
+        ackId: null,
+        channel: 'projectBoard-outbox',
+        recipient: 'dot',
+      },
     },
     reminderDeliveryFailed502: {
       ok: false,
       idempotencyKey: 'cmd-2026-10-14-77c3b0',
+      commandAccepted: true,
+      newRevision: 5,
       deliveryAck: {
         acknowledged: false,
+        outcome: 'failed_delivery',
         ackId: null,
-        channel: 'local-agent-ipc',
-        recipient: 'dot',
-        error: 'IPC socket /tmp/dot-supervisor.sock timed out after 3000ms (ENOENT).',
+        channel: 'local-notifier-adapter',
+        recipient: 'dot/macos-automation',
+        error: 'Target owner queue rejected message (EAGAIN).',
       },
       errorCode: 'DELIVERY_FAILED',
-      errorMessage: 'Reminder was NOT delivered to dot: IPC socket unavailable.',
+      errorMessage:
+        'Command was recorded, but reminder was NOT delivered to dot/macos-automation.',
+    },
+    uncertainWriteTimeout: {
+      ok: false,
+      idempotencyKey: 'cmd-2026-10-14-timeout-01',
+      commandAccepted: false,
+      deliveryAck: {
+        acknowledged: false,
+        outcome: 'uncertain_timeout',
+        ackId: null,
+        channel: 'live-http-command',
+        recipient: 'dot',
+        error: 'HTTP request timed out after 8000ms. Outcome is UNCERTAIN; do not blindly retry.',
+      },
+      errorCode: 'UNCERTAIN_WRITE_TIMEOUT',
+      errorMessage:
+        'Command request timed out. Refresh snapshot before retrying to prevent duplicate writes.',
     },
   },
 };

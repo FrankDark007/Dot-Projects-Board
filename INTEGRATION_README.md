@@ -1,136 +1,92 @@
-# `dot` Mission Control Dashboard — Local Integration Contract & README
+# `dot` Mission Control Dashboard — Local Integration Contract & Reliability Guide
 
-## 1. Purpose & Environment Boundary
-This dashboard was built in Google AI Studio with **zero access** to your Macs, local repositories, task sessions, MD workers, or private network. It does not claim to inspect live local machines from the cloud sandbox, and it requires **zero Gemini API calls** to render, evaluate, or refresh status.
+## 1. Purpose, Scope & Environment Boundary
+This dashboard was built and updated in Google AI Studio with **zero access** to your Macs, local repositories, task sessions, MD workers, or private network. It does not claim to inspect live local machines from the cloud sandbox, and it requires **zero Gemini API calls** to render, evaluate, or refresh status.
 
-It is structured as a clean, drop-in React + TypeScript module with separated schemas, deterministic state evaluators, synthetic fixtures, and an authenticated adapter ready for your local developer to wire into your existing **Mission Control** application.
-
----
-
-## 2. Module Layout (Separated for Easy Integration)
-
-- `src/schema/contract.ts` — Versioned TypeScript contract (`dot.mission-control.v1`) with stable IDs for `projects`, `tasks`, `workers`, `runs`, `decisions`, `evidence`, `events`, `notes`, and `reminders`.
-- `src/schema/jsonSchemas.ts` — Formal JSON Schema (Draft 2020-12) definitions and example payloads/errors for Snapshot, SSE Event Stream, and Operator Commands.
-- `src/engine/stateEvaluator.ts` — Pure, deterministic evaluation and deduplication functions (`deduplicateSnapshot`, `evaluateWorker`, `evaluateProject`, `evaluateAllProjects`).
-- `src/adapters/dataAdapter.ts` — Adapter layer separating **Demo Mode** (synthetic fixtures with a persistent `DEMO DATA` banner) and **Live Mode** (`fetchLiveSnapshot` with bounded polling, exponential backoff, background-tab throttling, `NOT CONNECTED` default, and `STALE` last-known snapshot preservation).
-- `src/fixtures/syntheticFixtures.ts` — Deterministic synthetic fixtures exercising all 11 required operational and failure states.
-- `src/tests/contractAndState.test.ts` & `src/tests/runTests.ts` — Automated test suite (11 test cases, 34 assertions) runnable via CLI (`npx tsx src/tests/runTests.ts`) or live inside the **Contract & Tests** tab.
+**Current Status**: All fixture, transport/validator, and UI behavior tests pass (`14/14` suites, `54` assertions). **Real local Mission Control integration remains UNVERIFIED** until a local developer connects the adapter to your local supervisor endpoint and runs end-to-end acceptance checks.
 
 ---
 
-## 3. Four-Dimensional Truthful State Rules
+## 2. Baseline Comparison & Rollback Instructions
 
-`src/engine/stateEvaluator.ts` enforces strict separation between four independent axes:
+### Baseline & Rollback Point
+Before applying the visual redesign and the 7 source-level reliability fixes, the workspace baseline (corresponding to `400b1142a497c57b7763cb53d0efd6a085f26cb9`) was snapshotted in Git under the tag `baseline-rollback-point`.
 
-1. **Project Completion & Verification (`acceptanceStatus` + Milestone Gates)**
-   - A finished agent turn (`status: 'succeeded_turn'`), git commit, or closed session **never** marks a project complete.
-   - A project only enters `recently_verified_complete` when `remainingMilestoneCount === 0`, `failedGateCount === 0`, and `acceptanceStatus === 'verified_passed'`.
-   - If a worker finishes its coding turn (`succeeded_turn`) and a required acceptance gate fails, the evaluator explicitly flags `Turn Finished · Acceptance Failed`.
-
-2. **Worker Execution Liveness vs. Meaningful Progress (`EvaluatedWorkerState`)**
-   - **Heartbeats prove process liveness, not task progress.**
-   - `active_running`: Requires `rawStatus === 'running'` AND a fresh heartbeat (`<= heartbeatExpirySeconds`, default 90s) AND fresh meaningful progress (`<= stalledProgressSeconds`, default 900s / 15m).
-   - `stalled_progress`: Heartbeat is fresh (process is alive), but no meaningful progress has occurred within `stalledProgressSeconds`.
-   - `stale_heartbeat`: Worker reported `'running'`, but its heartbeat expired (`> heartbeatExpirySeconds`). Not counted as active.
-   - `crashed` / `failed` / `idle` / `queued` / `disconnected` / `unknown`: Explicitly distinguished. When `workerCoverageKnown === false`, active worker count is `null` (`Unknown`), never a fabricated `0`.
-
-3. **Approval & Decision State (`ApprovalState`)**
-   - Open `DecisionRequest` records with `owner: 'you'` place the project into the `waiting_for_me` overview bucket and surface the exact question or failure, age, owner, and recommended next step in the prominent **Attention Queue**.
-
-4. **Connection Health (`ConnectionHealthState`)**
-   - `demo_synthetic`: Explicit Demo Mode with persistent `DEMO DATA — SYNTHETIC FIXTURES` banner.
-   - `not_connected`: Default Live Mode state until a valid `dot.mission-control.v1` snapshot is received. **Never silently substitutes demo data for a failed live feed.**
-   - `degraded_stale`: When a previously connected live feed drops, the UI preserves the last-known snapshot and displays a prominent `STALE DATA — LIVE FEED DISCONNECTED` warning banner with the timestamp of the last verified sync.
-
----
-
-## 4. Proposed Backend Endpoints (To Implement in Local Mission Control)
-
-These are **proposed contracts** for your local developer to mount in your Mission Control server (default base URL: `http://127.0.0.1:43110/api/mission-control/v1`).
-
-### A. `GET /api/mission-control/v1/snapshot`
-Returns a JSON payload matching `MissionControlSnapshot` (`schemaVersion: "dot.mission-control.v1"`).
-- **Headers**: `Accept: application/json`, `X-Mission-Control-Schema: dot.mission-control.v1`
-- **Polling Strategy**: Bounded polling (default 10s) with exponential backoff on network/5xx errors (capped at 60s) and automatic background-tab throttling (`4x` slower when `document.visibilityState === 'hidden'`).
-
-### B. `GET /api/mission-control/v1/events?sinceEventId=<id>` (Optional SSE Stream)
-Single Server-Sent Events stream emitting deduplicated `ActivityEvent` and `WorkerRecord` updates.
-- Every record is deduplicated on the client by both its primary ID (`eventId`, `workerId`, etc.) and `source.sourceId`.
-
-### C. `POST /api/mission-control/v1/commands`
-Executes operator controls with **idempotency** and **optimistic concurrency (`expectedRevision`)**:
-- Supported command types:
-  - `archive_project` (`archive: boolean` — supports Undo; **must not delete files or cancel running jobs**)
-  - `set_priority` (`priority: 'critical' | 'high' | 'normal' | 'low'`)
-  - `add_note` (`body: string`, `author: string`)
-  - `send_reminder` (`targetOwner: string`, `message: string`)
-  - `resolve_decision` (`decisionId: string`, `selectedOption?: string`, `resolutionNote: string`)
-
-#### Example Command Request
-```json
-{
-  "schemaVersion": "dot.mission-control.v1",
-  "idempotencyKey": "ui-rem-prj-context-compactor-r12-1760462100",
-  "expectedRevision": 12,
-  "issuedAt": "2026-10-14T17:15:00.000Z",
-  "command": {
-    "type": "send_reminder",
-    "projectId": "prj-context-compactor",
-    "targetOwner": "dot",
-    "message": "Verify RSS peak after shard 4 completes."
-  }
-}
-```
-
-#### Example Command Responses
-- **200 OK (Verified Delivery Acknowledgment)**:
-```json
-{
-  "ok": true,
-  "idempotencyKey": "ui-rem-prj-context-compactor-r12-1760462100",
-  "newRevision": 13,
-  "acknowledgedAt": "2026-10-14T17:15:00.120Z",
-  "deliveryAck": {
-    "acknowledged": true,
-    "ackId": "ack-ipc-99201",
-    "channel": "dot-supervisor-ipc",
-    "recipient": "dot"
-  }
-}
-```
-- **502 Bad Gateway (`DELIVERY_FAILED` — Never claim "dot notified" without ack)**:
-```json
-{
-  "ok": false,
-  "idempotencyKey": "ui-rem-prj-safari-dom-bridge-r4-1760462105",
-  "newRevision": 5,
-  "deliveryAck": {
-    "acknowledged": false,
-    "ackId": null,
-    "channel": "macos-automation-bridge",
-    "recipient": "dot/macos-automation",
-    "error": "Bridge daemon queue full (EAGAIN); delivery not acknowledged."
-  },
-  "errorCode": "DELIVERY_FAILED",
-  "errorMessage": "Reminder was NOT acknowledged by dot/macos-automation. Do not assume owner was notified."
-}
-```
-- **409 Conflict (`REVISION_CONFLICT`)**:
-```json
-{
-  "ok": false,
-  "idempotencyKey": "cmd-stale-rev-test",
-  "errorCode": "REVISION_CONFLICT",
-  "errorMessage": "Conflict on Context Window Compactor: expected revision 12, but current revision is 13."
-}
-```
-
----
-
-## 5. Running the Automated Tests
-
-Run the CLI verification suite:
+To inspect the diff or roll back to the pre-update state at any time:
 ```bash
-npx tsx src/tests/runTests.ts
+# View all changes since the baseline commit
+git diff baseline-rollback-point
+
+# Roll back the working tree to the baseline revision
+git checkout baseline-rollback-point
 ```
-Or open the **Contract & Tests** tab in the dashboard header to inspect and re-run all 11 scenarios interactively.
+
+---
+
+## 3. Source-Level Reliability Fixes Implemented
+
+1. **Real Advancing Clock in Live Mode (`src/App.tsx`, `src/utils/timeFormat.ts`, `src/engine/stateEvaluator.ts`)**
+   - Live mode uses a real advancing wall clock (`Date.now()`, ticking every `1,000ms`) rather than a frozen fixture timestamp.
+   - Demo mode defaults to the deterministic `REFERENCE_NOW_ISO` (`2026-10-14T17:15:00.000Z`) for reproducible fixture inspection, with a header toggle (**Advance Clock** / **Fixed Fixture Clock**) to test live heartbeat expiry (`>90s`) and stale-feed warnings (`>30s`) without waiting for a new snapshot.
+   - Any missing, unparseable, or future timestamp (`>5s` clock skew) is flagged as `timestampInvalidOrFuture: true` (`Uncertain timestamp`) and is **never** treated as fresh liveness or progress.
+
+2. **Strict Separation of Liveness, Meaningful Progress & Telemetry Coverage (`src/engine/stateEvaluator.ts`)**
+   - **Heartbeats prove process liveness, not task progress.**
+   - Every project evaluation exposes four distinct worker metrics:
+     - `confirmedRunningCount`: Workers with `rawStatus === 'running'` and a valid fresh heartbeat (`<= 90s`), **including** workers whose task progress has stalled.
+     - `confirmedProgressingCount`: Subset of confirmed-running workers that also emitted verified meaningful progress within `stalledProgressSeconds` (`<= 900s`).
+     - `stalledRunningCount`: Subset of confirmed-running workers whose process is alive (`heartbeat <= 90s`) but whose task progress is stalled (`> 900s` or missing/future timestamp).
+     - `unknownExecutionCount`: Workers with expired heartbeats (`stale_heartbeat`), invalid/future timestamps, `disconnected`, or `unknown` telemetry.
+   - Missing telemetry coverage (`workerCoverageKnown: false` or zero worker records with unverified coverage) returns `null` (`Telemetry Unavailable`) instead of `0` and **never** falsely marks a project as `Blocked`.
+
+3. **Runtime Snapshot Validation (`src/schema/validator.ts`)**
+   - All incoming Live payloads pass through `validateRuntimeSnapshot(rawPayload, previousSnapshot)` before touching application state.
+   - Rejects non-object roots, unsupported `schemaVersion`, invalid `observedAt` or `evaluationThresholds`, missing collection arrays, malformed records, duplicate primary IDs (`projectId`, `workerId`, `runId`, `decisionId`, `evidenceId`, `eventId`), broken cross-entity foreign references (`milestone.projectId`, `worker.projectId`, `worker.currentRunId`, `gate.evidenceIds`), negative token/cost figures, and out-of-order snapshots (`sequence < previous.sequence` or regressing `observedAt`).
+   - When a live poll returns malformed or out-of-order data after a valid snapshot was already loaded, `LivePollCoordinator` preserves the last valid snapshot, increments `consecutiveFailures`, and transitions connection state to `stale_last_known_preserved` with a detailed `SNAPSHOT_VALIDATION_FAILED` diagnostic.
+
+4. **Strict `Recently Verified Complete` Rules (`src/engine/stateEvaluator.ts`)**
+   - A finished coding turn (`status: 'succeeded_turn'`), git commit, or clean worker exit **never** marks a project complete.
+   - `recently_verified_complete` requires **all** of the following:
+     1. At least 1 milestone exists, and every milestone has `status === 'completed'` and `remainingSteps.length === 0`.
+     2. Every milestone has at least 1 `required: true` acceptance gate.
+     3. Every required acceptance gate has `status === 'passed'` (never `pending`, `running`, `failed`, or `skipped`).
+     4. Every required acceptance gate references at least 1 valid, existing `EvidenceLink` in `snapshot.evidence` with `verified: true` and a valid timestamp.
+     5. `project.acceptanceStatus === 'verified_passed'`, with zero open decisions and zero crashed/failed/stalled workers.
+   - Failed optional gates (`required: false`, `status: 'failed'`) are allowed on completed projects only when accompanied by a visible warning (`optionalFailedGateCount > 0` — e.g. `"Complete with 1 failed optional gate"`).
+
+5. **Hardened Live Polling, Abort Timeouts & Request Overlap Guards (`src/adapters/dataAdapter.ts`)**
+   - `LivePollCoordinator` enforces `AbortController` request timeouts (`requestTimeoutMs`, default `8,000ms`), single-flight poll guards (`skipped_in_flight` prevents overlapping requests), and monotonic generation tokens (`ignored_stale_generation` discards late responses after mode switches, endpoint edits, or manual resets).
+   - Explicitly distinguishes four connection states:
+     - `demo_fixture` — Synthetic fixtures with persistent `DEMO DATA` indicator.
+     - `never_connected` — Live mode before any valid snapshot has been received (`NOT CONNECTED`).
+     - `connected_fresh` — Valid live snapshot received within `staleFeedWarningSeconds`.
+     - `stale_last_known_preserved` — Previously connected live feed whose latest poll failed, timed out, or exceeded `staleFeedWarningSeconds`.
+
+6. **Safe Live vs. Demo Command Isolation (`src/adapters/dataAdapter.ts`, `src/App.tsx`)**
+   - Live mode never mutates demo state or falls back to demo command handlers.
+   - Live mode defaults to **Read-Only** (`allowLiveWrites: false`), explicitly disabling operator command buttons in the UI until write endpoints are enabled in Adapter Settings.
+   - Write commands (`POST /api/mission-control/v1/commands`) use a single bounded timeout and **never auto-retry** on timeout (`UNCERTAIN_WRITE_TIMEOUT`) to prevent duplicate side effects.
+   - Reminder commands clearly distinguish three outcomes in UI banners and audit history:
+     - `accepted_pending_delivery` — Queued by local daemon (`ackId`), awaiting next worker turn poll (never claims `"dot notified"` as an accomplished fact).
+     - `failed_delivery` — Delivery rejected (`502 DELIVERY_FAILED`); surfaces error without claiming notification succeeded.
+     - `uncertain_timeout` — Command POST timed out; outcome is explicitly marked uncertain.
+
+7. **Three-Tier Verification Suite (`src/tests/contractAndState.test.ts`, `src/tests/runTests.ts`)**
+   - **Suite 1 (`fixture_evaluator`)**: Tests normal execution, worker crash (`SIGSEGV`), advancing clock heartbeat expiry & future timestamp rejection, liveness vs. progress vs. missing coverage separation, strict verified completion with optional gate warnings, deduplication, and turn completion with failed acceptance.
+   - **Suite 2 (`transport_validator`)**: Tests `validateRuntimeSnapshot` (malformed records, duplicate IDs, broken references, negative costs, out-of-order sequences), `LivePollCoordinator` preservation of last valid snapshot on malformed/out-of-order payloads, `AbortController` timeouts, overlap prevention, late-response cancellation, and live write isolation.
+   - **Suite 3 (`ui_behavior`)**: Server-side renders `ProjectRow`, `ProjectCard`, `AttentionPanel`, and `TodayView` via `renderToStaticMarkup` to verify truthful badges, read-only disabled controls, and confirmed failure vs. missing telemetry distinction.
+
+---
+
+## 4. Running Verification & Build Checks
+
+```bash
+# Run all 14 synchronous + async verification tests (54 assertions)
+npm test
+
+# Type-check the codebase
+npm run lint
+
+# Build production bundle
+npm run build
+```

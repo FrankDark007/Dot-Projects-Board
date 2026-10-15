@@ -1,94 +1,204 @@
 /**
  * @file src/components/ContractAndTestsView.tsx
- * @description Interactive Verification & Integration Contract inspector displaying:
- * - All 11 automated test suite results and assertion counts
- * - Proposed Snapshot, Event Stream (SSE), and Command interfaces & JSON Schemas
- * - Clear boundary table of what works in Demo vs what requires Local Mission Control integration
+ * @description Truthful Verification & Integration Contract inspector.
+ * Separates Fixture/Evaluator tests, Mocked-HTTP Transport/Validator tests,
+ * UI Rendering tests, and Real Local Integration (which remains UNVERIFIED until
+ * connected to the local Mission Control / projectBoard backend).
  */
 
-import React, { useMemo, useState } from 'react';
-import { CheckCircle2, Code2, FileJson, Play, ShieldCheck, XCircle } from 'lucide-react';
+import React, { useEffect, useMemo, useState } from 'react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  ChevronDown,
+  ChevronUp,
+  Code2,
+  FileJson,
+  Play,
+  ShieldCheck,
+  XCircle,
+} from 'lucide-react';
 import {
   COMMAND_REQUEST_JSON_SCHEMA,
   CONTRACT_DOCUMENTATION_EXAMPLES,
   SNAPSHOT_JSON_SCHEMA,
 } from '../schema/jsonSchemas';
-import { runAllContractAndStateTests } from '../tests/contractAndState.test';
+import {
+  runAllContractAndStateTests,
+  runAsyncTransportTests,
+  TestCaseResult,
+} from '../tests/contractAndState.test';
 
 export const ContractAndTestsView: React.FC = () => {
   const [reRunCounter, setReRunCounter] = useState(0);
+  const [asyncResults, setAsyncResults] = useState<TestCaseResult[]>([]);
+  const [runningAsync, setRunningAsync] = useState(true);
+  const [schemaExpanded, setSchemaExpanded] = useState(false);
   const [schemaView, setSchemaView] = useState<'snapshot' | 'command' | 'errors'>('snapshot');
 
-  const testSummary = useMemo(() => {
+  const syncSummary = useMemo(() => {
     void reRunCounter;
     return runAllContractAndStateTests();
   }, [reRunCounter]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setRunningAsync(true);
+    void runAsyncTransportTests().then((res) => {
+      if (!cancelled) {
+        setAsyncResults(res.results);
+        setRunningAsync(false);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [reRunCounter]);
+
+  const allResults = [...syncSummary.results, ...asyncResults];
+  const passedCount = allResults.filter((r) => r.passed).length;
+  const totalAssertions = allResults.reduce((acc, r) => acc + r.assertionsRun, 0);
+
   return (
-    <div className="space-y-8">
-      {/* 1. Automated Verification Suite Panel */}
-      <section className="bg-white border border-slate-200 rounded-xl p-6">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 mb-5 border-b border-slate-200">
+    <div className="space-y-6">
+      {/* 1. Scope & Truthful Verification Status Banner */}
+      <section className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg p-5">
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 mb-4 border-b border-slate-200 dark:border-slate-800">
           <div>
-            <div className="flex items-center gap-2 text-xs font-medium text-emerald-800 mb-1">
-              <ShieldCheck className="w-4 h-4 text-emerald-700" />
-              <span>Automated Contract & Truthful State Test Suite</span>
-              <span aria-hidden="true">·</span>
-              <span className="font-mono tabular-nums">
-                {testSummary.passedTests}/{testSummary.totalTests} passed (
-                {testSummary.totalAssertions} assertions)
+            <div className="flex flex-wrap items-center gap-2 text-xs mb-1">
+              <span className="inline-flex items-center gap-1 font-semibold text-teal-700 dark:text-teal-400">
+                <ShieldCheck className="w-4 h-4" />
+                <span>Automated Sandbox Suites: {passedCount}/{allResults.length} Passed</span>
+              </span>
+              <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
+                ·
+              </span>
+              <span className="font-mono tabular-nums text-slate-600 dark:text-slate-400">
+                {totalAssertions} assertions executed
+              </span>
+              <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
+                ·
+              </span>
+              <span className="inline-flex items-center gap-1 font-semibold text-amber-800 dark:text-amber-400">
+                <AlertTriangle className="w-3.5 h-3.5" />
+                <span>Real Local Integration: UNVERIFIED</span>
               </span>
             </div>
-            <h2 className="text-lg font-semibold text-slate-900">
-              11 Required Edge-Case & State Separation Scenarios
+            <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
+              Test Scope Separation: Fixture Logic, Mocked Transport, UI Rendering &amp; Local Integration
             </h2>
           </div>
 
           <button
             type="button"
+            disabled={runningAsync}
             onClick={() => setReRunCounter((c) => c + 1)}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-slate-900 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Play className="w-3.5 h-3.5" />
-            <span>Re-Run Automated Tests</span>
+            <span>{runningAsync ? 'Running Suites...' : 'Re-Run All Suites'}</span>
           </button>
         </div>
 
-        <div className="border border-slate-200 rounded-lg overflow-x-auto">
+        {/* 4-Column Scope Matrix */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs mb-5">
+          <div className="border border-slate-200 dark:border-slate-800 rounded-md p-3">
+            <div className="font-semibold text-slate-900 dark:text-slate-100 mb-1">
+              1. Fixture &amp; Evaluator Suite
+            </div>
+            <div className="font-mono text-teal-700 dark:text-teal-400 mb-1">
+              VERIFIED (Deterministic Clock)
+            </div>
+            <p className="text-[11px] text-slate-600 dark:text-slate-400">
+              Tests heartbeat expiry without new snapshots, future timestamp skew, strict Verified
+              Complete gates, and liveness vs. stalled progress.
+            </p>
+          </div>
+
+          <div className="border border-slate-200 dark:border-slate-800 rounded-md p-3">
+            <div className="font-semibold text-slate-900 dark:text-slate-100 mb-1">
+              2. Transport &amp; Validator Suite
+            </div>
+            <div className="font-mono text-teal-700 dark:text-teal-400 mb-1">
+              VERIFIED (Mocked HTTP)
+            </div>
+            <p className="text-[11px] text-slate-600 dark:text-slate-400">
+              Tests runtime schema validation, duplicate ID &amp; out-of-order rejection, hung
+              request timeouts, overlap guards, and late response cancellation.
+            </p>
+          </div>
+
+          <div className="border border-slate-200 dark:border-slate-800 rounded-md p-3">
+            <div className="font-semibold text-slate-900 dark:text-slate-100 mb-1">
+              3. UI &amp; Isolation Suite
+            </div>
+            <div className="font-mono text-teal-700 dark:text-teal-400 mb-1">
+              VERIFIED (Component Render)
+            </div>
+            <p className="text-[11px] text-slate-600 dark:text-slate-400">
+              Tests compact rows, card views, disabled controls in read-only Live Mode, and
+              confirmed failure vs. missing info labels.
+            </p>
+          </div>
+
+          <div className="border border-amber-300 dark:border-amber-800/80 bg-amber-50/40 dark:bg-amber-950/20 rounded-md p-3">
+            <div className="font-semibold text-slate-900 dark:text-slate-100 mb-1">
+              4. Real Local Integration
+            </div>
+            <div className="font-mono font-semibold text-amber-800 dark:text-amber-400 mb-1">
+              UNVERIFIED IN SANDBOX
+            </div>
+            <p className="text-[11px] text-slate-700 dark:text-slate-300">
+              Requires wiring into your local Mission Control / projectBoard backend and running
+              end-to-end local acceptance checks.
+            </p>
+          </div>
+        </div>
+
+        {/* Detailed Test Results Table */}
+        <div className="border border-slate-200 dark:border-slate-800 rounded-md overflow-x-auto">
           <table className="w-full text-left border-collapse text-xs">
             <thead>
-              <tr className="border-b border-slate-200 bg-slate-50 text-slate-600">
-                <th className="py-2.5 px-3 font-medium">Status</th>
-                <th className="py-2.5 px-3 font-medium">Scenario</th>
-                <th className="py-2.5 px-3 font-medium">Verification Assertion Details</th>
-                <th className="py-2.5 px-3 font-medium text-right">Assertions</th>
+              <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 text-slate-600 dark:text-slate-400">
+                <th className="py-2 px-3 font-medium">Result</th>
+                <th className="py-2 px-3 font-medium">Suite Scope</th>
+                <th className="py-2 px-3 font-medium">Scenario &amp; Verification Details</th>
+                <th className="py-2 px-3 font-medium text-right">Assertions</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-200">
-              {testSummary.results.map((res) => (
-                <tr key={res.id} className="hover:bg-slate-50/80">
-                  <td className="py-3 px-3 whitespace-nowrap">
+            <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+              {allResults.map((res) => (
+                <tr key={res.id} className="hover:bg-slate-50/80 dark:hover:bg-slate-900/40">
+                  <td className="py-2.5 px-3 whitespace-nowrap">
                     {res.passed ? (
-                      <span className="inline-flex items-center gap-1 font-mono font-semibold text-emerald-800">
-                        <CheckCircle2 className="w-4 h-4 text-emerald-700" />
+                      <span className="inline-flex items-center gap-1 font-mono font-semibold text-teal-700 dark:text-teal-400">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
                         <span>PASS</span>
                       </span>
                     ) : (
-                      <span className="inline-flex items-center gap-1 font-mono font-semibold text-red-700">
-                        <XCircle className="w-4 h-4 text-red-700" />
+                      <span className="inline-flex items-center gap-1 font-mono font-semibold text-red-700 dark:text-red-400">
+                        <XCircle className="w-3.5 h-3.5" />
                         <span>FAIL</span>
                       </span>
                     )}
                   </td>
-                  <td className="py-3 px-3">
-                    <div className="font-semibold text-slate-900">{res.scenarioCategory}</div>
-                    <div className="font-mono text-[11px] text-slate-500">{res.id}</div>
+                  <td className="py-2.5 px-3 font-mono text-[11px] text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                    {res.scope}
                   </td>
-                  <td className="py-3 px-3 text-slate-700">
-                    <div>{res.name}</div>
-                    <div className="text-slate-500 mt-0.5">{res.details}</div>
+                  <td className="py-2.5 px-3 text-slate-700 dark:text-slate-300">
+                    <div className="font-semibold text-slate-900 dark:text-slate-100">
+                      {res.name}
+                    </div>
+                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                      {res.details}
+                    </div>
+                    {res.error && (
+                      <div className="text-[11px] font-mono text-red-700 dark:text-red-400 mt-1">
+                        {res.error}
+                      </div>
+                    )}
                   </td>
-                  <td className="py-3 px-3 font-mono text-right tabular-nums text-slate-700">
+                  <td className="py-2.5 px-3 font-mono text-right tabular-nums text-slate-700 dark:text-slate-300">
                     {res.assertionsRun}
                   </td>
                 </tr>
@@ -98,184 +208,122 @@ export const ContractAndTestsView: React.FC = () => {
         </div>
       </section>
 
-      {/* 2. Delivery Truthfulness: Demo vs Tested vs Local Integration Checklist */}
-      <section className="bg-white border border-slate-200 rounded-xl p-6">
-        <h2 className="text-lg font-semibold text-slate-900 mb-1">
-          Delivery Boundary: What Works in Demo, What Was Tested & What Requires Local Integration
-        </h2>
-        <p className="text-xs text-slate-600 mb-5">
-          This dashboard is built in Google AI Studio without access to your Macs, local
-          repositories, task sessions, MD workers, or private network. It does not claim to be
-          live until wired to your local Mission Control backend and verified against acceptance
-          checks.
-        </p>
-
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-5 text-xs">
-          <div className="border border-slate-200 rounded-lg p-4">
-            <h3 className="font-semibold text-slate-900 mb-2">
-              1. Works Now in This Build (Demo & UI)
-            </h3>
-            <ul className="space-y-1.5 text-slate-700 list-disc pl-4">
-              <li>
-                Four-dimensional state separation (Completion vs Worker Liveness/Progress vs
-                Approval vs Connection Health).
-              </li>
-              <li>
-                Overview buckets (Working Now, Blocked, Waiting For Me, Unfinished, Verified
-                Complete) and Attention Queue.
-              </li>
-              <li>
-                Expandable milestone workflow & acceptance gate diagrams on every project card.
-              </li>
-              <li>
-                Interactive controls: Archive with Undo, Priority mutation, Operator Notes,
-                Decision resolution, and Reminders with delivery ack checks.
-              </li>
-              <li>
-                Explicit Live Mode adapter (`fetchLiveSnapshot`) with bounded polling, backoff,
-                background-tab throttling, `NOT CONNECTED` default, and `STALE` preservation.
-              </li>
-            </ul>
-          </div>
-
-          <div className="border border-slate-200 rounded-lg p-4">
-            <h3 className="font-semibold text-slate-900 mb-2">
-              2. Verified by Automated Tests (11 Scenarios)
-            </h3>
-            <ul className="space-y-1.5 text-slate-700 list-disc pl-4">
-              <li>Normal execution (`active_running` requires fresh heartbeat + fresh progress).</li>
-              <li>Worker crash (`SIGSEGV` exit 139 marks worker crashed &amp; project blocked).</li>
-              <li>Heartbeat expiry (`&gt;90s` marks worker `stale_heartbeat`, 0 active count).</li>
-              <li>Stalled progress (`18s` heartbeat + `48m` no progress marks `stalled_progress`).</li>
-              <li>Disconnected sources & unknown worker coverage (`null` count, never fake 0).</li>
-              <li>Missing/partial costs (`knownUsd: null` or explicit `Estimate` label).</li>
-              <li>Duplicate event deduplication by stable `eventId` & `source.sourceId`.</li>
-              <li>Completed execution turn (`succeeded_turn`) with failed acceptance gate.</li>
-              <li>Idempotency replay, `REVISION_CONFLICT` (409), and failed reminder ack.</li>
-            </ul>
-          </div>
-
-          <div className="border border-slate-200 rounded-lg p-4">
-            <h3 className="font-semibold text-slate-900 mb-2">
-              3. Requires Local Mission Control Integration
-            </h3>
-            <ul className="space-y-1.5 text-slate-700 list-disc pl-4">
-              <li>
-                Mounting `GET /api/mission-control/v1/snapshot` in your local Mission Control
-                server to emit `dot.mission-control.v1` JSON from real Mac/MD worker state.
-              </li>
-              <li>
-                Wiring `POST /api/mission-control/v1/commands` to your local SQLite/state store
-                and `dot` supervisor IPC socket for real reminder delivery acks.
-              </li>
-              <li>
-                Attaching local HttpOnly session cookie or localhost bearer middleware.
-              </li>
-              <li>
-                Running end-to-end local acceptance gate checks before declaring the integration
-                live.
-              </li>
-            </ul>
-          </div>
-        </div>
-      </section>
-
-      {/* 3. Proposed Integration Contract & JSON Schemas */}
-      <section className="bg-white border border-slate-200 rounded-xl p-6">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 mb-5 border-b border-slate-200">
-          <div>
-            <div className="flex items-center gap-2 text-xs font-medium text-slate-600 mb-1">
-              <FileJson className="w-4 h-4 text-slate-700" />
-              <span>Proposed Integration Contract (dot.mission-control.v1)</span>
-            </div>
-            <h2 className="text-lg font-semibold text-slate-900">
-              Proposed Snapshot, Event Stream & Command Interfaces
-            </h2>
-          </div>
-
-          <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
-            <button
-              type="button"
-              onClick={() => setSchemaView('snapshot')}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                schemaView === 'snapshot'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Snapshot Schema
-            </button>
-            <button
-              type="button"
-              onClick={() => setSchemaView('command')}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                schemaView === 'command'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Command Schema
-            </button>
-            <button
-              type="button"
-              onClick={() => setSchemaView('errors')}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-                schemaView === 'errors'
-                  ? 'bg-white text-slate-900 shadow-xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Endpoints & Error Responses
-            </button>
-          </div>
-        </div>
-
-        {schemaView === 'snapshot' && (
-          <div>
-            <p className="text-xs text-slate-600 mb-3">
-              JSON Schema (`https://json-schema.org/draft/2020-12/schema`) for{' '}
-              <code className="font-mono text-slate-900">MissionControlSnapshot</code>:
-            </p>
-            <pre className="bg-slate-900 text-slate-100 font-mono text-xs p-4 rounded-lg overflow-x-auto max-h-96">
-              {JSON.stringify(SNAPSHOT_JSON_SCHEMA, null, 2)}
-            </pre>
-          </div>
-        )}
-
-        {schemaView === 'command' && (
-          <div>
-            <p className="text-xs text-slate-600 mb-3">
-              JSON Schema for <code className="font-mono text-slate-900">OperatorCommandRequest</code>{' '}
-              (enforcing <code className="font-mono">idempotencyKey</code> and{' '}
-              <code className="font-mono">expectedRevision</code>):
-            </p>
-            <pre className="bg-slate-900 text-slate-100 font-mono text-xs p-4 rounded-lg overflow-x-auto max-h-96">
-              {JSON.stringify(COMMAND_REQUEST_JSON_SCHEMA, null, 2)}
-            </pre>
-          </div>
-        )}
-
-        {schemaView === 'errors' && (
-          <div className="space-y-4">
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              {CONTRACT_DOCUMENTATION_EXAMPLES.endpoints.map((ep) => (
-                <div key={ep.path} className="border border-slate-200 rounded-lg p-3.5 text-xs">
-                  <div className="font-mono font-semibold text-slate-900 mb-1">
-                    {ep.method} {ep.path}
-                  </div>
-                  <p className="text-slate-600 mb-2">{ep.description}</p>
-                </div>
-              ))}
-            </div>
+      {/* 2. Expandable Technical Diagnostics & Proposed Schemas */}
+      <section className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg p-5">
+        <div className="flex items-center justify-between gap-4">
+          <div className="flex items-center gap-2">
+            <FileJson className="w-4 h-4 text-slate-600 dark:text-slate-400" />
             <div>
-              <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-900 mb-2">
-                <Code2 className="w-4 h-4 text-slate-600" />
-                <span>Example Conflict (409) & Failed Delivery (502) Responses</span>
-              </div>
-              <pre className="bg-slate-900 text-slate-100 font-mono text-xs p-4 rounded-lg overflow-x-auto max-h-80">
-                {JSON.stringify(CONTRACT_DOCUMENTATION_EXAMPLES.errorResponses, null, 2)}
-              </pre>
+              <h2 className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+                Proposed Snapshot &amp; Future Command Contract Schemas (dot.mission-control.v1)
+              </h2>
+              <p className="text-xs text-slate-500 dark:text-slate-400">
+                Technical JSON schemas, idempotency rules, and commandAccepted vs. deliveryAck
+                examples.
+              </p>
             </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setSchemaExpanded((prev) => !prev)}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded cursor-pointer whitespace-nowrap shrink-0"
+          >
+            {schemaExpanded ? (
+              <>
+                <ChevronUp className="w-3.5 h-3.5" />
+                <span>Hide Technical Schemas</span>
+              </>
+            ) : (
+              <>
+                <ChevronDown className="w-3.5 h-3.5" />
+                <span>Expand Technical Schemas</span>
+              </>
+            )}
+          </button>
+        </div>
+
+        {schemaExpanded && (
+          <div className="mt-4 pt-4 border-t border-slate-200 dark:border-slate-800 space-y-4">
+            <div className="flex items-center gap-1 p-1 bg-slate-100 dark:bg-slate-900 rounded-md w-fit">
+              <button
+                type="button"
+                onClick={() => setSchemaView('snapshot')}
+                className={`px-3 py-1 text-xs font-medium rounded cursor-pointer ${
+                  schemaView === 'snapshot'
+                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                Snapshot Schema
+              </button>
+              <button
+                type="button"
+                onClick={() => setSchemaView('command')}
+                className={`px-3 py-1 text-xs font-medium rounded cursor-pointer ${
+                  schemaView === 'command'
+                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                Future Command Schema
+              </button>
+              <button
+                type="button"
+                onClick={() => setSchemaView('errors')}
+                className={`px-3 py-1 text-xs font-medium rounded cursor-pointer ${
+                  schemaView === 'errors'
+                    ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-xs'
+                    : 'text-slate-600 dark:text-slate-400'
+                }`}
+              >
+                Endpoints &amp; Outcome Examples
+              </button>
+            </div>
+
+            {schemaView === 'snapshot' && (
+              <pre className="bg-slate-900 text-slate-100 font-mono text-xs p-4 rounded-md overflow-x-auto max-h-96">
+                {JSON.stringify(SNAPSHOT_JSON_SCHEMA, null, 2)}
+              </pre>
+            )}
+
+            {schemaView === 'command' && (
+              <pre className="bg-slate-900 text-slate-100 font-mono text-xs p-4 rounded-md overflow-x-auto max-h-96">
+                {JSON.stringify(COMMAND_REQUEST_JSON_SCHEMA, null, 2)}
+              </pre>
+            )}
+
+            {schemaView === 'errors' && (
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                  {CONTRACT_DOCUMENTATION_EXAMPLES.endpoints.map((ep) => (
+                    <div
+                      key={ep.path}
+                      className="border border-slate-200 dark:border-slate-800 rounded-md p-3 text-xs"
+                    >
+                      <div className="font-mono font-semibold text-slate-900 dark:text-slate-100 mb-0.5">
+                        {ep.method} {ep.path}
+                      </div>
+                      <div className="text-[11px] font-medium text-sky-700 dark:text-sky-400 mb-1">
+                        {ep.status}
+                      </div>
+                      <p className="text-slate-600 dark:text-slate-400">{ep.description}</p>
+                    </div>
+                  ))}
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-900 dark:text-slate-100 mb-2">
+                    <Code2 className="w-4 h-4 text-slate-500" />
+                    <span>
+                      Command Accepted vs. Delivery Acknowledged vs. Uncertain Timeout Examples
+                    </span>
+                  </div>
+                  <pre className="bg-slate-900 text-slate-100 font-mono text-xs p-4 rounded-md overflow-x-auto max-h-80">
+                    {JSON.stringify(CONTRACT_DOCUMENTATION_EXAMPLES.errorResponses, null, 2)}
+                  </pre>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </section>

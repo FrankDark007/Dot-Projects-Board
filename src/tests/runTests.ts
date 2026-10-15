@@ -1,26 +1,45 @@
 /**
  * @file src/tests/runTests.ts
- * @description CLI runner for the automated contract & state evaluation test suite.
+ * @description CLI runner executing both synchronous Fixture/Evaluator/UI tests
+ * and asynchronous Mocked-HTTP Transport & Timeout regression tests.
  */
 
-import { runAllContractAndStateTests } from './contractAndState.test';
+import {
+  runAllContractAndStateTests,
+  runAsyncTransportTests,
+} from './contractAndState.test';
 
-const summary = runAllContractAndStateTests();
+async function main() {
+  const syncSummary = runAllContractAndStateTests();
+  const asyncSummary = await runAsyncTransportTests();
 
-console.log('==============================================================');
-console.log(`dot Mission Control — Automated Verification Suite`);
-console.log(`Tests Passed: ${summary.passedTests}/${summary.totalTests} (${summary.totalAssertions} assertions)`);
-console.log('==============================================================');
+  const allResults = [...syncSummary.results, ...asyncSummary.results];
+  const totalTests = syncSummary.totalTests + asyncSummary.totalTests;
+  const passedTests = syncSummary.passedTests + asyncSummary.passedTests;
+  const totalAssertions = syncSummary.totalAssertions + asyncSummary.totalAssertions;
 
-for (const res of summary.results) {
-  const status = res.passed ? '[PASS]' : '[FAIL]';
-  console.log(`${status} ${res.id}: ${res.name} (${res.assertionsRun} assertions)`);
-  console.log(`       -> ${res.details}`);
-  if (res.error) {
-    console.error(`       !! ${res.error}`);
+  console.log('======================================================================');
+  console.log('dot Mission Control — Regression & Verification Suite');
+  console.log(
+    `Tests Passed: ${passedTests}/${totalTests} (${totalAssertions} assertions across Fixture, Transport & UI suites)`
+  );
+  console.log('Real Local Mission Control Integration: UNVERIFIED (Cloud Sandbox Build)');
+  console.log('======================================================================');
+
+  for (const res of allResults) {
+    const status = res.passed ? '[PASS]' : '[FAIL]';
+    console.log(
+      `${status} [${res.scope}] ${res.id}: ${res.name} (${res.assertionsRun} assertions)`
+    );
+    console.log(`       -> ${res.details}`);
+    if (res.error) {
+      console.error(`       !! ${res.error}`);
+    }
+  }
+
+  if (!syncSummary.allPassed || !asyncSummary.allPassed) {
+    process.exit(1);
   }
 }
 
-if (!summary.allPassed) {
-  process.exit(1);
-}
+void main();
