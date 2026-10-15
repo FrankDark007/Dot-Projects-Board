@@ -1,62 +1,75 @@
 # `dot` Mission Control Dashboard — Local Integration Contract & Reliability Guide
 
 ## 1. Purpose, Scope & Environment Boundary
-This dashboard was built and updated in Google AI Studio with **zero access** to your Macs, local repositories, task sessions, MD workers, or private network.
-- **No fabricated telemetry**: All data shown in **Demo Mode** is explicitly marked as `SYNTHETIC DEMO DATA — LOCAL MISSION CONTROL NOT CONNECTED`.
-- **Strict Mode & Endpoint Isolation**: Switching to **Live Mode** starts in an explicit `NOT CONNECTED` state and never silently falls back to synthetic fixtures when a poll fails or times out. Switching endpoints (`A → B` or `A → B → A`) immediately clears endpoint-bound snapshots, permissions, connection health, and feedback banners while aborting and invalidating any in-flight reads or commands from the previous endpoint.
-- **Reversible Operator Controls**: Priority updates, project archive/unarchive (with 1-click Undo), operator notes, reminders, and decision resolutions use a single idempotent command envelope (`POST /api/mission-control/v1/commands`).
+This dashboard was built and verified in an isolated sandbox with **zero access** to your Macs, local repositories, task sessions, MD workers, or private network.
+- **No Real Integration or Deployment Claimed**: Real local Mission Control integration is **unverified** in this environment (`UNVERIFIED IN CLOUD SANDBOX`) and no deployment has been performed.
+- **No Fabricated Telemetry**: All data shown in **Demo Mode** uses deterministic synthetic fixtures and is explicitly marked as `SYNTHETIC DEMO DATA — LOCAL MISSION CONTROL NOT CONNECTED`.
+- **Strict Mode & Endpoint Isolation**: Switching to **Live Mode** starts in an explicit `NOT CONNECTED` state and never silently falls back to synthetic fixtures when a poll fails, times out, or returns invalid data. Switching endpoints (`A → B` or `A → B → A`) or modes immediately increments the monotonic connection generation token, aborts in-flight reads and commands, and clears endpoint-bound snapshots, capabilities, reachability flags (`liveInitialDataRejected`), historical contact timestamps (`liveLastContactAt`), selection state, and feedback banners.
+- **Reversible Operator Controls**: Priority updates, project archive/unarchive (with 1-click Undo), operator notes, reminders, and decision resolutions use a single idempotent command envelope (`POST /api/mission-control/v1/commands`). Uncertain write timeouts (`UNCERTAIN_WRITE_TIMEOUT`) are never retried automatically.
 
 ---
 
 ## 2. Baseline & Rollback Instructions
-- **Reviewed Baseline Commit**: `077498e72ee7626ecb380fc5f2a443dbeea03a1c` (parent `400b1142a497c57b7763cb53d0efd6a085f26cb9`).
-- **Inspect or Revert Changes**:
-  - Compare with baseline: `git diff 077498e72ee7626ecb380fc5f2a443dbeea03a1c`
-  - Roll back if needed: `git checkout 077498e72ee7626ecb380fc5f2a443dbeea03a1c`
+- **Reviewed Baseline Commit**: `f8f0dd07bce41de4004b9b0e5429c1a0ec58eade`
+- **Inspect or Roll Back by Reviewed Git Commit** (use local Git commit hashes directly; no remote tag is claimed):
+  - Compare working tree or HEAD against baseline:
+    ```bash
+    git diff f8f0dd07bce41de4004b9b0e5429c1a0ec58eade
+    ```
+  - Roll back to the reviewed baseline commit if needed:
+    ```bash
+    git checkout f8f0dd07bce41de4004b9b0e5429c1a0ec58eade
+    ```
 
 ---
 
-## 3. Summary of the 7 Defect Repairs
+## 3. Summary of Architecture & Reliability Safeguards
 
-1. **Continuous Single-Flight Polling Loop (`src/App.tsx`, `src/adapters/dataAdapter.ts`)**
-   - Replaced the one-shot `useEffect` timeout with a self-rescheduling, single-flight polling loop (`runPollCycle`) that schedules the next poll after every completion (`connected`, `stale`, `error`, `timeout`, or `invalid_payload`) using exponential backoff (`1.5^failures` up to `60s`) and background-tab throttling (`visibilityState === 'hidden'`).
-   - Automatically stops and invalidates timers and in-flight requests on unmount, mode change, or endpoint change.
-   - Verified on a mounted `App` instance with fake timers across 5 consecutive successful polls, 2 consecutive HTTP failures with backoff (`1500ms`, `2250ms`), recovery (`1000ms`), and unmount cleanup.
+1. **Separated Transport Contact, Snapshot Envelope Age, Worker Source Age & Terminal-Worker Rules (`src/adapters/dataAdapter.ts`, `src/engine/stateEvaluator.ts`, `src/App.tsx`)**
+   - **HTTP Transport Contact (`lastSuccessfulContactAt` & `liveInitialDataRejected`)**: Recorded immediately upon receiving an HTTP 200 response from the endpoint, before JSON parsing and schema validation.
+     - If an HTTP 200 response contains malformed JSON, fails schema validation, or regresses per-source sequence ordering (`OUT_OF_ORDER_SNAPSHOT`), transport contact still advances while the invalid payload is rejected (`rejected_validation_preserved_last`) and the last valid snapshot is preserved (`connectionHealth: 'stale'`).
+     - If no valid snapshot has ever been received (`snapshot === null`), `liveInitialDataRejected` is derived strictly from the **latest non-ignored poll outcome** (`outcome.status === 'rejected_validation_preserved_last' && outcome.snapshot === null`). An initial HTTP 200 invalid JSON response reports `LIVE MODE — ENDPOINT REACHABLE · INVALID INITIAL DATA REJECTED`, whereas if a subsequent poll times out or fails at the network layer, current status transitions to `LIVE MODE — NOT CONNECTED` (`Live: Never connected`) while retaining the historical `Last HTTP contact` timestamp as diagnostic evidence.
+   - **Snapshot Envelope Age (`snapshot.generatedAt`)**: Evaluated independently from HTTP contact time so a server repeatedly serving an old cached snapshot over HTTP 200 transitions to `stale`.
+   - **Worker Source Observation Age (`worker.source.observedAt`)**: Evaluated per worker (`isSourceObservationFresh`). A fresh snapshot envelope and fresh `lastHeartbeatAt` with a stale `worker.source.observedAt` (`> heartbeatExpirySeconds`) cannot confirm a running worker alive (`telemetryStatus: 'stale_observation'`) and never masks a stale running sibling worker.
+   - **Proven Stopped / Terminal Worker Rule (`isProvenStoppedOrTerminalWorker`)**: Workers in a proven stopped or terminal state (`status` in `stopped | crashed | failed` or `authoritativeStopProof` present) retain their historical `sourceObservationAgeSeconds` and `oldestWorkerSourceAgeSeconds` diagnostics (`historical (terminal)` in the UI), but do not count toward `staleSourceObservationCount`, do not trigger adapter stale-source warnings, and do not exclude a project with another fresh confirmed-running worker from `working_now`.
+   - **Static Project Metadata Isolation**: Old static `project.source.observedAt` metadata alone never marks the live transport connection stale or disconnected.
 
-2. **Complete Endpoint Isolation Across `A → B` and `A → B → A` (`src/App.tsx`, `src/adapters/dataAdapter.ts`, `src/components/AdapterConfigModal.tsx`)**
-   - Shared monotonic `connectionGenRef` token across both live snapshot reads and live command dispatches.
-   - Switching endpoints or modes aborts all in-flight `AbortController` instances, resets `LivePollCoordinator`, clears `liveSnapshot`, `liveConnectionHealth`, `liveLastError`, `liveLastContactAt`, `liveDataFreshness`, `selectedProjectId`, and `feedbackBanner`, and starts polling with the new `LiveAdapterConfig` explicitly passed into `runPollCycle(nextConfig, nextGen)`.
-   - Late read or command responses from `A` (#1) or `B` are ignored even when switching `A → B → A` while requests are still pending.
+2. **Isolated Async Verification Runner & Live Polling Timer Protection (`src/tests/runTests.ts`, `src/components/ContractAndTestsView.tsx`, `src/tests/recordedVerificationReport.json`)**
+   - The operational `Contract & Tests` view never executes the fake-timer/mock-DOM async suite inside the live browser page and never replaces `globalThis.setTimeout`, `clearTimeout`, `Date.now`, or `fetch`.
+   - `npx tsx src/tests/runTests.ts` executes both synchronous and fake-timer async suites in Node (`happy-dom`), restores the real clock inside `finally`, and records the real execution timestamp (`new RealDate().toISOString()`), runner command (`npx tsx src/tests/runTests.ts`), and isolation mode (`dev_test_runner_recorded`) into `src/tests/recordedVerificationReport.json`.
+   - `ContractAndTestsView` displays `recordedAt`, `runnerCommand`, and `executionIsolation`, and provides two distinct controls: **Re-Run Sync Checks (11)** (re-evaluates pure synchronous checks in-memory) and **Reload Recorded Async Results (7)** (reloads the recorded async report without touching live polling timers).
 
-3. **Strict Evidence & Gate Requirements for `Verified Complete` (`src/engine/stateEvaluator.ts`)**
-   - Every required milestone must define at least one required acceptance gate (`requiredGates.length > 0`). Required milestones with zero required gates are flagged in `requiredMilestonesMissingGates` and blocked from `Verified Complete`.
-   - Every required acceptance gate must have `status === 'passed'`, a valid non-future `verifiedAt` timestamp, and a non-empty `evidenceId` that resolves to an existing `EvidenceLink` in `snapshot.evidence` with `verified === true` and a valid non-future `observedAt` timestamp.
-   - Optional gate failures (`required: false`) remain non-blocking warnings (`acceptanceWarnings`) and do not block `Verified Complete`.
+3. **Command Recipient Binding & Contradiction Guards (`src/schema/validator.ts`, `src/adapters/dataAdapter.ts`, `src/App.tsx`)**
+   - `validateCommandResponsePayload` enforces HTTP status (`httpOk` and `200..299` required when `ok: true`), exact `idempotencyKey` match, optional `commandType`/`projectId` match, and rejects contradictory responses where `ok: true` is paired with `commandAccepted: false` or a non-empty `errorCode` (such as `DELIVERY_FAILED`).
+   - For `send_reminder`, `deliveryAck` is mandatory when `ok: true`, must be internally consistent (`delivered_acknowledged` requires `acknowledged: true` and `ackId`; pending/failed/timeout states require `acknowledged: false`), and `deliveryAck.recipient` must strictly match the dispatched `payload.recipient` (e.g., dispatching to `Alice` and receiving an ack for `Bob` is rejected as `VALIDATION_ERROR`).
 
-4. **Complete Runtime Validation (`src/schema/validator.ts`, `src/engine/stateEvaluator.ts`)**
-   - Validates every field consumed by the UI and evaluator before state publication: nested strings, booleans (`evidence.verified` must be boolean, `milestone.required`, `gate.required`, `worker.coverageAvailable`, `project.archived`, `project.workerCoverageKnown`), enums, timestamps, numeric values, and non-empty `decision.owner` / `blocker.owner` / `project.owner`.
-   - Enforces full relational integrity: `worker.currentRunId -> snapshot.runs` (with matching `workerId` and `projectId`), `run.workerId -> snapshot.workers`, `run.milestoneId -> project.milestones`, `gate.evidenceId -> snapshot.evidence`, `milestone.dependsOnMilestoneIds` (existence + self-dependency check), `project.currentMilestoneId`, `project.latestUsefulResult.evidenceId`, `task.assignedWorkerId`, and `decision.milestoneId`.
-   - Enforces per-source sequence monotonicity across snapshots (`OUT_OF_ORDER_SNAPSHOT`) and deterministic per-source event sequence resolution (`deduplicateAndOrderEvents`).
-   - Invalid snapshots are rejected before state publication while preserving the last valid snapshot with a clear warning banner.
+4. **Continuous Single-Flight Polling Loop & Complete Endpoint Isolation (`src/App.tsx`, `src/adapters/dataAdapter.ts`)**
+   - Self-rescheduling single-flight polling loop (`runLivePollCycle`) with exponential backoff (`1.5^failures` up to `maxBackoffMs`) and background-tab throttling (`visibilityState === 'hidden'`).
+   - Full generation isolation across `A → B` and `A → B → A` transitions while snapshot reads and command writes are in flight.
 
-5. **Live Command Response Validation & Dispatch Rechecks (`src/schema/validator.ts`, `src/adapters/dataAdapter.ts`, `src/App.tsx`)**
-   - `executeLiveCommand` rechecks connection health (`connected` or `stale`), `capabilities.commandEndpointVerified`, and the specific per-command capability (`canArchive`, `canChangePriority`, `canAddNote`, `canSendReminder`, `canResolveDecision`) at dispatch time.
-   - `validateCommandResponsePayload` verifies HTTP status (`httpOk` and `200..299` required when `ok: true` — an HTTP 500 with `{ ok: true }` is rejected as `VALIDATION_ERROR`), exact `idempotencyKey` match, optional `commandType`/`projectId` match, valid `newRevision`, and internally consistent `deliveryAck` (`delivered_acknowledged` requires `acknowledged: true` and `ackId`; `accepted_pending_delivery` / `failed_delivery` / `uncertain_timeout` require `acknowledged: false`).
-
-6. **Separated Transport Contact Time vs Snapshot Data Freshness (`src/adapters/dataAdapter.ts`, `src/App.tsx`)**
-   - `LivePollCoordinator` and `App` track `lastSuccessfulContactAt` (HTTP 200 transport contact) separately from `dataFreshness` (`evaluateSnapshotDataFreshness`, which measures the age of `snapshot.generatedAt` and the newest entity `source.observedAt` against the evaluation clock).
-   - If a server repeatedly returns HTTP 200 with an old snapshot whose timestamps exceed the freshness threshold (`max(staleFeedWarningSeconds, 3 * pollInterval)`), connection health transitions to `stale` (`HTTP 200 OK · Snapshot Data Stale`) while still recording `lastSuccessfulContactAt`.
-
-7. **Truthful Dynamic Verification Badges (`src/components/ContractAndTestsView.tsx`)**
-   - Verification badges for `Fixture & Evaluator Suite`, `Transport, Validator & Live Command Suite`, and `UI & Mounted Component Suite` are derived dynamically from completed test results (`UNEXECUTED`, `PENDING / RUNNING...`, `FAILED`, or `VERIFIED`).
-   - `Real Local Mission Control Integration` is explicitly labeled `UNVERIFIED IN CLOUD SANDBOX`.
+5. **Strict Evidence & Gate Requirements for `Verified Complete` & Hostile-Input Runtime Validation (`src/engine/stateEvaluator.ts`, `src/schema/validator.ts`)**
+   - Every required milestone must define `>= 1` required gate, and every required gate must pass with a valid non-future `verifiedAt` and an existing `verified: true` `EvidenceLink` with a valid non-future `observedAt`.
+   - Complete runtime validation checks all required fields, types, references, and per-source sequence monotonicity before state publication.
 
 ---
 
-## 4. Verification & Test Suite
-Run the full automated verification suite (17 tests, 109 assertions across Fixture/Evaluator, Transport/Validator, and Mounted React 19 UI/DOM suites):
+## 4. Verification, Lint, Build & Browser Layout Suites
+
+### Automated Regression, Lint & Build Commands
+Run the complete verification suite (**18/18 tests, 154 assertions**: 11 synchronous tests / 68 assertions + 7 recorded async tests / 86 assertions):
 ```bash
-npm test
+npx tsx src/tests/runTests.ts
 npm run lint
 npm run build
 ```
+
+### Headless Chromium Browser Layout & Geometry Suite (`37/37` States)
+- **Prerequisites**:
+  1. Start the application server on port `3000` (e.g., `npm run dev`) or set `VERIFY_APP_URL` to the running URL (defaults to `http://127.0.0.1:3000`).
+  2. Ensure `playwright` and a Chromium binary are available (`CHROMIUM_BIN` env var or standard system paths `/usr/bin/chromium`, `/usr/bin/chromium-browser`, `/usr/bin/google-chrome`, or macOS `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`).
+- **Command**:
+  ```bash
+  npx tsx src/tests/verifyLayoutBrowser.ts
+  ```
+  Verifies all **37/37** responsive viewport (`320px` to `1920px`), sidebar (`expanded`/`collapsed`), content (`demo`/`stress`), and `200%` zoom states with zero horizontal overflow, zero clipping, and zero sibling overlap.
+

@@ -18,6 +18,7 @@ import {
   Code2,
   FileJson,
   Play,
+  RefreshCw,
   ShieldCheck,
   XCircle,
 } from 'lucide-react';
@@ -28,15 +29,20 @@ import {
 } from '../schema/jsonSchemas';
 import {
   runAllContractAndStateTests,
-  runAsyncTransportTests,
   TestCaseResult,
   TestSuiteScope,
 } from '../tests/contractAndState.test';
+import {
+  getBundledRecordedAsyncVerificationReport,
+  loadRecordedAsyncVerificationReport,
+  RecordedAsyncVerificationReport,
+} from '../tests/recordedVerificationReport';
 
 export interface ContractAndTestsViewProps {
   overrideSyncResults?: TestCaseResult[];
   overrideAsyncResults?: TestCaseResult[];
   overrideRunningAsync?: boolean;
+  loadAsyncReportImpl?: () => Promise<RecordedAsyncVerificationReport>;
 }
 
 interface ScopeVerificationSummary {
@@ -108,10 +114,33 @@ export const ContractAndTestsView: React.FC<ContractAndTestsViewProps> = ({
   overrideSyncResults,
   overrideAsyncResults,
   overrideRunningAsync,
+  loadAsyncReportImpl,
 }) => {
-  const [reRunCounter, setReRunCounter] = useState(0);
-  const [asyncResults, setAsyncResults] = useState<TestCaseResult[]>([]);
-  const [runningAsync, setRunningAsync] = useState(true);
+  const initialBundledReport = useMemo(
+    () => getBundledRecordedAsyncVerificationReport(),
+    []
+  );
+  // Separate synchronous in-memory check execution from reloading recorded async runner results
+  const [syncRunCounter, setSyncRunCounter] = useState(0);
+  const [asyncReloadCounter, setAsyncReloadCounter] = useState(0);
+  const [recordedReportMeta, setRecordedReportMeta] = useState<{
+    schemaVersion: string;
+    runnerCommand: string;
+    recordedAt: string;
+    executionIsolation: string;
+  }>({
+    schemaVersion: initialBundledReport.schemaVersion,
+    runnerCommand: initialBundledReport.runnerCommand,
+    recordedAt: initialBundledReport.recordedAt,
+    executionIsolation: initialBundledReport.executionIsolation,
+  });
+  const [asyncResults, setAsyncResults] = useState<TestCaseResult[]>(() =>
+    loadAsyncReportImpl ? [] : initialBundledReport.results
+  );
+  const [runningAsync, setRunningAsync] = useState<boolean>(() =>
+    Boolean(loadAsyncReportImpl)
+  );
+  const [asyncLoadError, setAsyncLoadError] = useState<string | null>(null);
   const [schemaExpanded, setSchemaExpanded] = useState(false);
   const [schemaView, setSchemaView] = useState<'snapshot' | 'command' | 'errors'>('snapshot');
 
@@ -127,26 +156,76 @@ export const ContractAndTestsView: React.FC<ContractAndTestsViewProps> = ({
         results: overrideSyncResults,
       };
     }
-    void reRunCounter;
+    void syncRunCounter;
     return runAllContractAndStateTests();
-  }, [reRunCounter, overrideSyncResults]);
+  }, [syncRunCounter, overrideSyncResults]);
 
   useEffect(() => {
     if (overrideAsyncResults !== undefined || overrideRunningAsync !== undefined) {
       return;
     }
+    // On initial mount with default bundled report and no custom loader, results are already loaded synchronously without touching global timers
+    if (asyncReloadCounter === 0 && !loadAsyncReportImpl) {
+      return;
+    }
+
     let cancelled = false;
     setRunningAsync(true);
-    void runAsyncTransportTests().then((res) => {
-      if (!cancelled) {
-        setAsyncResults(res.results);
-        setRunningAsync(false);
+    setAsyncLoadError(null);
+
+    const loader = loadAsyncReportImpl ?? loadRecordedAsyncVerificationReport;
+    void (async () => {
+      try {
+        const report = await loader();
+        if (!cancelled) {
+          setAsyncResults(report.results);
+          setRecordedReportMeta({
+            schemaVersion: report.schemaVersion,
+            runnerCommand: report.runnerCommand,
+            recordedAt: report.recordedAt,
+            executionIsolation: report.executionIsolation,
+          });
+          setAsyncLoadError(null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          const errMsg =
+            err instanceof Error ? err.message : 'Failed to load recorded async verification report';
+          setAsyncLoadError(errMsg);
+          setAsyncResults([
+            {
+              id: 'async-report-load-failure-transport',
+              scope: 'transport_validator',
+              name: 'Recorded Async Transport Suite Loader',
+              scenarioCategory: 'Verification report reload',
+              passed: false,
+              assertionsRun: 0,
+              details: 'Failed to reload recorded dev/test runner verification results.',
+              error: errMsg,
+            },
+            {
+              id: 'async-report-load-failure-ui',
+              scope: 'ui_behavior',
+              name: 'Recorded Async Mounted UI Suite Loader',
+              scenarioCategory: 'Verification report reload',
+              passed: false,
+              assertionsRun: 0,
+              details: 'Failed to reload recorded dev/test runner verification results.',
+              error: errMsg,
+            },
+          ]);
+        }
+      } finally {
+        if (!cancelled) {
+          setRunningAsync(false);
+        }
       }
-    });
+    })();
+
     return () => {
       cancelled = true;
     };
-  }, [reRunCounter, overrideAsyncResults, overrideRunningAsync]);
+  }, [asyncReloadCounter, overrideAsyncResults, overrideRunningAsync, loadAsyncReportImpl]);
 
   const effectiveAsyncResults =
     overrideAsyncResults !== undefined ? overrideAsyncResults : asyncResults;
@@ -231,8 +310,8 @@ export const ContractAndTestsView: React.FC<ContractAndTestsViewProps> = ({
     <div className="space-y-6">
       {/* 1. Scope & Truthful Verification Status Banner */}
       <section className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg p-5">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 mb-4 border-b border-slate-200 dark:border-slate-800">
-          <div>
+        <div className="flex flex-col lg:flex-row lg:items-start justify-between gap-4 pb-4 mb-4 border-b border-slate-200 dark:border-slate-800">
+          <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2 text-xs mb-1">
               <span className={`inline-flex items-center gap-1 font-semibold ${overallBannerTone}`}>
                 {failedCount > 0 ? (
@@ -269,17 +348,58 @@ export const ContractAndTestsView: React.FC<ContractAndTestsViewProps> = ({
             <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
               Test Scope Separation: Fixture Logic, Mocked Transport, Mounted UI Interaction &amp; Local Integration
             </h2>
+            <div
+              data-testid="verification-provenance-summary"
+              className="text-[11px] font-mono text-slate-500 dark:text-slate-400 mt-1.5 space-y-1"
+            >
+              <div>
+                <span className="font-semibold text-slate-700 dark:text-slate-300">
+                  Synchronous Checks ({syncSummary.passedTests}/{syncSummary.totalTests} passed · run #{syncRunCounter + 1}):
+                </span>{' '}
+                Executed live in-memory without touching page timers, clock, or fetch.
+              </div>
+              <div>
+                <span className="font-semibold text-slate-700 dark:text-slate-300">
+                  Recorded Async Runner Provenance:
+                </span>{' '}
+                Command <code data-testid="recorded-report-command">{recordedReportMeta.runnerCommand}</code>{' '}
+                · Recorded at{' '}
+                <code data-testid="recorded-report-timestamp">{recordedReportMeta.recordedAt}</code>{' '}
+                · Provenance{' '}
+                <code data-testid="recorded-report-isolation">{recordedReportMeta.executionIsolation}</code>{' '}
+                (Schema: <code>{recordedReportMeta.schemaVersion}</code>). Async fake-timer &amp; mounted
+                UI suites never execute in the live page, preserving active timers and queued polling.
+                {asyncLoadError ? ` Reload error: ${asyncLoadError}` : ''}
+              </div>
+            </div>
           </div>
 
-          <button
-            type="button"
-            disabled={effectiveRunningAsync}
-            onClick={() => setReRunCounter((c) => c + 1)}
-            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
-          >
-            <Play className="w-3.5 h-3.5" />
-            <span>{effectiveRunningAsync ? 'Running Suites...' : 'Re-Run All Suites'}</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2 shrink-0">
+            <button
+              type="button"
+              data-testid="rerun-sync-checks-btn"
+              onClick={() => setSyncRunCounter((c) => c + 1)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-800 dark:text-slate-100 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 border border-slate-300 dark:border-slate-700 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Play className="w-3.5 h-3.5" />
+              <span>Re-Run Sync Checks</span>
+            </button>
+
+            <button
+              type="button"
+              data-testid="reload-recorded-async-btn"
+              disabled={effectiveRunningAsync}
+              onClick={() => setAsyncReloadCounter((c) => c + 1)}
+              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${effectiveRunningAsync ? 'animate-spin' : ''}`} />
+              <span>
+                {effectiveRunningAsync
+                  ? 'Reloading Recorded Async Results...'
+                  : 'Reload Recorded Async Results'}
+              </span>
+            </button>
+          </div>
         </div>
 
         {/* 4-Column Scope Matrix — Dynamically Derived from Executed Test Results */}

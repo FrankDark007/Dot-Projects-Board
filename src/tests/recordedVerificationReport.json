@@ -1,0 +1,75 @@
+{
+  "schemaVersion": "dot.verification-report.v1",
+  "recordedAt": "2026-10-15T05:32:10.360Z",
+  "runnerCommand": "npx tsx src/tests/runTests.ts",
+  "executionIsolation": "dev_test_runner_recorded",
+  "allPassed": true,
+  "totalTests": 7,
+  "passedTests": 7,
+  "totalAssertions": 86,
+  "results": [
+    {
+      "id": "async-01-preserve-last-valid-and-stale-data-freshness",
+      "scope": "transport_validator",
+      "name": "Transport vs Data Freshness: Preserves last valid snapshot on malformed/out-of-order responses and marks repeated old snapshots stale on HTTP 200",
+      "scenarioCategory": "Validation preservation & data freshness",
+      "passed": true,
+      "assertionsRun": 10,
+      "details": "Verified HTTP 200 invalid JSON/schema/out-of-order contact tracking, transport vs envelope vs worker source vs static project metadata freshness separation, and terminal worker exclusion."
+    },
+    {
+      "id": "async-02-timeout-overlap-and-late-response-cancellation",
+      "scope": "transport_validator",
+      "name": "Connection Handling: Aborts hung requests on timeout, prevents overlapping polls, and ignores late responses after mode/endpoint reset",
+      "scenarioCategory": "Timeouts, overlap & late responses",
+      "passed": true,
+      "assertionsRun": 3,
+      "details": "Verified 50ms AbortSignal timeout on hung requests, skipped_in_flight overlap guard, and ignored_stale_generation on late responses."
+    },
+    {
+      "id": "async-03-live-command-validation-and-isolation",
+      "scope": "transport_validator",
+      "name": "Live Command Guard & Validation: Rechecks capability/connection at dispatch, rejects HTTP 500 ok:true & mismatched keys, and flags UNCERTAIN_WRITE_TIMEOUT without retry",
+      "scenarioCategory": "Live command validation & timeout",
+      "passed": true,
+      "assertionsRun": 8,
+      "details": "Verified dispatch capability/connection checks, Alice->Bob rejection, contradictory ok:true+commandAccepted:false / errorCode:DELIVERY_FAILED rejection, and single-attempt UNCERTAIN_WRITE_TIMEOUT."
+    },
+    {
+      "id": "async-04-mounted-app-continuous-polling-backoff-recovery",
+      "scope": "ui_behavior",
+      "name": "Mounted App Continuous Polling: Executes 5+ consecutive successful polls via fake timers, backs off on failures, recovers, and stops on unmount",
+      "scenarioCategory": "Continuous polling, backoff & recovery",
+      "passed": true,
+      "assertionsRun": 24,
+      "details": "Verified 5 consecutive successful polls on mounted App, 1.5x/2.25x backoff on failures, initial HTTP 200 invalid JSON -> network failure -> valid recovery reachability accuracy, and full stop on unmount."
+    },
+    {
+      "id": "async-05-mounted-app-endpoint-isolation-a-b-a",
+      "scope": "ui_behavior",
+      "name": "Mounted App Endpoint Isolation: Clears old data/permissions and invalidates pending reads & commands across A → B and A → B → A transitions",
+      "scenarioCategory": "Endpoint isolation (A → B → A)",
+      "passed": true,
+      "assertionsRun": 12,
+      "details": "Verified complete endpoint isolation across A → B and A → B → A while reads and commands are pending."
+    },
+    {
+      "id": "async-06-mounted-ui-interactions-and-repeated-controls",
+      "scope": "ui_behavior",
+      "name": "Mounted UI Interactions: Verifies archive + undo, repeated priority changes, search/filter switching, and read-only control disabling in mounted DOM",
+      "scenarioCategory": "Mounted UI interactions & controls",
+      "passed": true,
+      "assertionsRun": 15,
+      "details": "Verified mounted DOM archive + undo, repeated priority mutations, collapsible sidebar, and Live Mode command contradiction/recipient-mismatch rejections."
+    },
+    {
+      "id": "async-07-verification-view-isolation-during-live-polling",
+      "scope": "ui_behavior",
+      "name": "Verification View Isolation: Opening and re-running/reloading Contract & Tests never replaces live timers/fetch or interrupts ongoing polling, with failure cleanup",
+      "scenarioCategory": "Verification isolation & failure cleanup",
+      "passed": true,
+      "assertionsRun": 14,
+      "details": "Verified opening Contract & Tests renders recordedAt/command/provenance, separates Re-Run Sync Checks from Reload Recorded Async Results, and never interrupts ongoing live polling."
+    }
+  ]
+}

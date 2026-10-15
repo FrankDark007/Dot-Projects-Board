@@ -113,14 +113,14 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
       className="fixed inset-y-0 right-0 z-40 w-full max-w-2xl bg-white dark:bg-[#111827] border-l border-slate-200 dark:border-slate-800 shadow-2xl flex flex-col overflow-hidden"
     >
       {/* Side Panel Header */}
-      <div className="flex items-start justify-between gap-4 px-5 py-4 border-b border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-900/80">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2 text-xs text-slate-600 dark:text-slate-400 mb-1">
-            <span className="font-semibold text-slate-900 dark:text-slate-100">
+      <div className="flex items-start justify-between gap-4 px-5 py-4 border-b border-slate-200 dark:border-slate-800 bg-slate-50/80 dark:bg-slate-900/80 min-w-0">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-slate-600 dark:text-slate-400 mb-1 min-w-0">
+            <span className="font-semibold text-slate-900 dark:text-slate-100 min-w-0 break-words [overflow-wrap:anywhere]">
               {evaluated.primaryStatusLabel}
             </span>
             <span aria-hidden="true">·</span>
-            <span className="font-mono text-slate-500 dark:text-slate-400">
+            <span className="font-mono text-slate-500 dark:text-slate-400 min-w-0 break-words [overflow-wrap:anywhere]">
               {project.projectId}
             </span>
             <span aria-hidden="true">·</span>
@@ -128,18 +128,18 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
               rev v{project.revision}
             </span>
             <span aria-hidden="true">·</span>
-            <span>
+            <span className="min-w-0 break-words [overflow-wrap:anywhere]">
               Owner:{' '}
               <strong className="text-slate-900 dark:text-slate-100">{project.owner}</strong>
             </span>
           </div>
           <h2
             id="project-detail-title"
-            className="text-lg font-bold text-slate-900 dark:text-slate-100 tracking-tight"
+            className="text-lg font-bold text-slate-900 dark:text-slate-100 tracking-tight min-w-0 break-words [overflow-wrap:anywhere]"
           >
             {project.name}
           </h2>
-          <p className="text-xs text-slate-600 dark:text-slate-400 mt-1">
+          <p className="text-xs text-slate-600 dark:text-slate-400 mt-1 min-w-0 break-words [overflow-wrap:anywhere]">
             {project.currentScope}
           </p>
         </div>
@@ -149,19 +149,19 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
           type="button"
           onClick={onClose}
           aria-label="Close project detail side panel"
-          className="p-1.5 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/60 dark:hover:bg-slate-800 rounded-md transition-colors cursor-pointer shrink-0"
+          className="min-h-[34px] min-w-[34px] p-1.5 inline-flex items-center justify-center text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-200/60 dark:hover:bg-slate-800 rounded-md transition-colors cursor-pointer shrink-0"
         >
           <X className="w-5 h-5" />
         </button>
       </div>
 
       {/* Sub-Toolbar: Segmented Tabs + Quick Controls */}
-      <div className="flex flex-wrap items-center justify-between gap-2.5 px-5 py-2.5 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827]">
-        <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 dark:bg-slate-900 rounded-md">
+      <div className="flex flex-wrap items-center justify-between gap-2.5 px-5 py-2.5 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] min-w-0">
+        <div className="flex flex-wrap items-center gap-1 p-1 bg-slate-100 dark:bg-slate-900 rounded-md min-w-0">
           <button
             type="button"
             onClick={() => setActiveTab('overview_gates')}
-            className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`min-h-[32px] px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
               activeTab === 'overview_gates'
                 ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-xs'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
@@ -172,7 +172,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
           <button
             type="button"
             onClick={() => setActiveTab('workers_runs')}
-            className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`min-h-[32px] px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
               activeTab === 'workers_runs'
                 ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-xs'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
@@ -183,7 +183,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
           <button
             type="button"
             onClick={() => setActiveTab('evidence_timeline')}
-            className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`min-h-[32px] px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
               activeTab === 'evidence_timeline'
                 ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-xs'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
@@ -194,7 +194,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
           <button
             type="button"
             onClick={() => setActiveTab('decisions_notes')}
-            className={`px-2.5 py-1 text-xs font-medium rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+            className={`min-h-[32px] px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer ${
               activeTab === 'decisions_notes'
                 ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-xs'
                 : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white'
@@ -204,7 +204,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
           </button>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
           <select
             aria-label="Project priority"
             value={project.priority}
@@ -212,7 +212,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
             onChange={(e) =>
               onChangePriority(project.projectId, e.target.value as PriorityLevel)
             }
-            className="text-xs font-medium bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2 py-1 text-slate-800 dark:text-slate-200 disabled:opacity-50 cursor-pointer"
+            className="min-h-[34px] max-w-full text-xs font-medium bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1.5 text-slate-800 dark:text-slate-200 disabled:opacity-50 cursor-pointer"
           >
             <option value="critical">Priority: Critical</option>
             <option value="high">Priority: High</option>
@@ -224,16 +224,16 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
             type="button"
             disabled={!capabilities.canArchive}
             onClick={() => onToggleArchive(project.projectId, !project.archived)}
-            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 whitespace-nowrap shrink-0 cursor-pointer"
+            className="min-h-[34px] inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 cursor-pointer"
           >
             {project.archived ? (
               <>
-                <ArchiveRestore className="w-3.5 h-3.5" />
+                <ArchiveRestore className="w-3.5 h-3.5 shrink-0" />
                 <span>Unarchive</span>
               </>
             ) : (
               <>
-                <Archive className="w-3.5 h-3.5" />
+                <Archive className="w-3.5 h-3.5 shrink-0" />
                 <span>Archive</span>
               </>
             )}
@@ -242,18 +242,18 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
       </div>
 
       {/* Scrollable Content Body */}
-      <div className="p-5 overflow-y-auto space-y-6 flex-1">
+      <div className="p-5 overflow-y-auto space-y-6 flex-1 min-w-0">
         {!capabilities.canChangePriority && capabilities.reasonIfDisabled && (
-          <div className="bg-amber-50/70 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/60 rounded-md p-2.5 text-xs text-amber-900 dark:text-amber-200">
+          <div className="bg-amber-50/70 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/60 rounded-md p-2.5 text-xs text-amber-900 dark:text-amber-200 min-w-0 break-words [overflow-wrap:anywhere]">
             <strong>Read-Only Controls:</strong> {capabilities.reasonIfDisabled}
           </div>
         )}
 
         {/* TAB 1: MILESTONE TIMELINE, DEPLOYMENT REVISION, COST COVERAGE & GATES */}
         {activeTab === 'overview_gates' && (
-          <div className="space-y-5">
+          <div className="space-y-5 min-w-0">
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div className="border border-slate-200 dark:border-slate-800 rounded-md p-3">
+              <div className="min-w-0 border border-slate-200 dark:border-slate-800 rounded-md p-3 break-words [overflow-wrap:anywhere]">
                 <div className="text-[11px] text-slate-500 dark:text-slate-400 mb-1">
                   Deployment Revision
                 </div>
@@ -269,7 +269,8 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                         : 'Health Unverified'}
                     </div>
                     <div className="text-[10px] font-mono text-slate-400 tabular-nums mt-0.5">
-                      Deployed {formatRelativeAge(project.deployedRevision.deployedAt, referenceNowIso)}
+                      Deployed{' '}
+                      {formatRelativeAge(project.deployedRevision.deployedAt, referenceNowIso)}
                     </div>
                   </>
                 ) : (
@@ -279,7 +280,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                 )}
               </div>
 
-              <div className="border border-slate-200 dark:border-slate-800 rounded-md p-3">
+              <div className="min-w-0 border border-slate-200 dark:border-slate-800 rounded-md p-3 break-words [overflow-wrap:anywhere]">
                 <div className="text-[11px] text-slate-500 dark:text-slate-400 mb-1">
                   Cost Coverage & Metering
                 </div>
@@ -299,18 +300,19 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                 )}
               </div>
 
-              <div className="border border-slate-200 dark:border-slate-800 rounded-md p-3">
+              <div className="min-w-0 border border-slate-200 dark:border-slate-800 rounded-md p-3 break-words [overflow-wrap:anywhere]">
                 <div className="text-[11px] text-slate-500 dark:text-slate-400 mb-1">
-                  Source Attribution
+                  Static Metadata Source Attribution
                 </div>
-                <div className="text-xs font-mono text-slate-900 dark:text-slate-100 truncate">
+                <div className="text-xs font-mono text-slate-900 dark:text-slate-100">
                   {project.source.emitterName}
                 </div>
-                <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 tabular-nums mt-0.5 truncate">
+                <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 tabular-nums mt-0.5">
                   {project.source.sourceId}
                 </div>
                 <div className="text-[10px] font-mono text-slate-400 tabular-nums mt-0.5">
-                  {formatUtcShort(project.source.observedAt)}
+                  Observed {formatRelativeAge(project.source.observedAt, referenceNowIso)} (
+                  {formatUtcShort(project.source.observedAt)})
                 </div>
               </div>
             </div>
@@ -321,7 +323,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
               referenceNowIso={referenceNowIso}
             />
 
-            <div>
+            <div className="min-w-0">
               <h3 className="text-xs font-semibold text-slate-900 dark:text-slate-100 mb-2">
                 Tracked Tasks ({tasks.length})
               </h3>
@@ -343,13 +345,13 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                     <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
                       {tasks.map((t) => (
                         <tr key={t.taskId}>
-                          <td className="py-2 px-3">
+                          <td className="py-2 px-3 min-w-0 break-words [overflow-wrap:anywhere]">
                             <div className="font-medium text-slate-900 dark:text-slate-100">
                               {t.title}
                             </div>
                             <div className="text-slate-500 dark:text-slate-400">{t.summary}</div>
                           </td>
-                          <td className="py-2 px-3 font-mono text-slate-700 dark:text-slate-300">
+                          <td className="py-2 px-3 font-mono text-slate-700 dark:text-slate-300 break-words [overflow-wrap:anywhere]">
                             {t.owner}
                           </td>
                           <td className="py-2 px-3 font-mono text-slate-800 dark:text-slate-200">
@@ -368,16 +370,16 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
           </div>
         )}
 
-        {/* TAB 2: WORKERS & RUNS (Separating Liveness, Progress & Unknown Coverage) */}
+        {/* TAB 2: WORKERS & RUNS */}
         {activeTab === 'workers_runs' && (
-          <div className="space-y-5">
+          <div className="space-y-5 min-w-0">
             <div>
               <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
                 <h3 className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                  Worker Liveness vs. Progress vs. Unknown Coverage
+                  Worker Liveness vs. Progress vs. Source Observation Age
                 </h3>
                 <span className="text-[11px] text-slate-500 dark:text-slate-400">
-                  Expired heartbeats mark execution UNKNOWN unless stop proof exists
+                  Expired heartbeats or stale worker source observations mark execution UNKNOWN
                 </span>
               </div>
 
@@ -398,14 +400,14 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                       <tr className="border-b border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900 text-slate-600 dark:text-slate-400">
                         <th className="py-2 px-3 font-medium">Worker / Source</th>
                         <th className="py-2 px-3 font-medium">Evaluated State</th>
-                        <th className="py-2 px-3 font-medium text-right">Heartbeat Age</th>
+                        <th className="py-2 px-3 font-medium text-right">Heartbeat / Obs Age</th>
                         <th className="py-2 px-3 font-medium text-right">Progress Age</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
                       {workerSummary.workers.map((w) => (
                         <tr key={w.workerId}>
-                          <td className="py-2.5 px-3">
+                          <td className="py-2.5 px-3 min-w-0 break-words [overflow-wrap:anywhere]">
                             <div className="font-mono font-semibold text-slate-900 dark:text-slate-100">
                               {w.name}
                             </div>
@@ -413,7 +415,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                               {w.role} · {w.source.emitterName}
                             </div>
                           </td>
-                          <td className="py-2.5 px-3">
+                          <td className="py-2.5 px-3 min-w-0 break-words [overflow-wrap:anywhere]">
                             <div
                               className={`font-mono font-semibold ${
                                 w.evaluatedState === 'active_running'
@@ -434,14 +436,24 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                             </div>
                           </td>
                           <td className="py-2.5 px-3 font-mono text-right tabular-nums text-slate-700 dark:text-slate-300">
-                            {formatRelativeAge(w.lastHeartbeatAt, referenceNowIso)}
+                            <div>HB: {formatRelativeAge(w.lastHeartbeatAt, referenceNowIso)}</div>
+                            <div
+                              className={`text-[10px] ${
+                                w.staleSourceObservation
+                                  ? 'font-semibold text-amber-800 dark:text-amber-400'
+                                  : 'text-slate-500 dark:text-slate-400'
+                              }`}
+                            >
+                              Obs: {formatRelativeAge(w.source.observedAt, referenceNowIso)}
+                              {w.staleSourceObservation ? ' (STALE)' : ''}
+                            </div>
                           </td>
                           <td className="py-2.5 px-3 font-mono text-right tabular-nums text-slate-700 dark:text-slate-300">
                             <div>
                               {formatRelativeAge(w.lastMeaningfulProgressAt, referenceNowIso)}
                             </div>
                             {w.lastProgressSummary && (
-                              <div className="text-[10px] font-sans text-slate-500 dark:text-slate-400">
+                              <div className="text-[10px] font-sans text-slate-500 dark:text-slate-400 break-words [overflow-wrap:anywhere]">
                                 {w.lastProgressSummary}
                               </div>
                             )}
@@ -467,11 +479,11 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                   {runs.map((run) => (
                     <div
                       key={run.runId}
-                      className="border border-slate-200 dark:border-slate-800 rounded-md p-3 text-xs"
+                      className="border border-slate-200 dark:border-slate-800 rounded-md p-3 text-xs min-w-0 break-words [overflow-wrap:anywhere]"
                     >
                       <div className="flex flex-wrap items-center justify-between gap-2 mb-1">
-                        <div className="flex items-center gap-2 font-mono">
-                          <Terminal className="w-3.5 h-3.5 text-slate-500" />
+                        <div className="flex flex-wrap items-center gap-2 font-mono min-w-0">
+                          <Terminal className="w-3.5 h-3.5 text-slate-500 shrink-0" />
                           <span className="font-semibold text-slate-900 dark:text-slate-100">
                             {run.runId}
                           </span>
@@ -516,7 +528,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
 
         {/* TAB 3: EVIDENCE LINKS & DEDUPLICATED TIMELINE */}
         {activeTab === 'evidence_timeline' && (
-          <div className="space-y-5">
+          <div className="space-y-5 min-w-0">
             <div>
               <h3 className="text-xs font-semibold text-slate-900 dark:text-slate-100 mb-2">
                 Verified Evidence & Artifacts ({evidence.length})
@@ -530,12 +542,14 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                   {evidence.map((ev) => (
                     <div
                       key={ev.evidenceId}
-                      className="border border-slate-200 dark:border-slate-800 rounded-md p-3 text-xs"
+                      className="border border-slate-200 dark:border-slate-800 rounded-md p-3 text-xs min-w-0 break-words [overflow-wrap:anywhere]"
                     >
-                      <div className="flex items-start justify-between gap-2 mb-1">
-                        <div className="flex items-center gap-1.5 font-semibold text-slate-900 dark:text-slate-100">
+                      <div className="flex items-start justify-between gap-2 mb-1 min-w-0">
+                        <div className="flex items-center gap-1.5 font-semibold text-slate-900 dark:text-slate-100 min-w-0">
                           <FileCode2 className="w-3.5 h-3.5 text-slate-500 shrink-0" />
-                          <span>{ev.label}</span>
+                          <span className="min-w-0 break-words [overflow-wrap:anywhere]">
+                            {ev.label}
+                          </span>
                         </div>
                         <span
                           className={`font-mono text-[11px] shrink-0 ${
@@ -575,7 +589,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                   {events.map((ev) => (
                     <div
                       key={ev.eventId}
-                      className="border border-slate-200 dark:border-slate-800 rounded-md p-3 text-xs"
+                      className="border border-slate-200 dark:border-slate-800 rounded-md p-3 text-xs min-w-0 break-words [overflow-wrap:anywhere]"
                     >
                       <div className="flex flex-wrap items-center justify-between gap-1 text-[11px] text-slate-500 dark:text-slate-400 mb-1">
                         <span className="font-mono font-medium text-slate-800 dark:text-slate-200">
@@ -599,7 +613,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
 
         {/* TAB 4: DECISIONS, NOTES & REMINDER RECEIPTS */}
         {activeTab === 'decisions_notes' && (
-          <div className="space-y-5">
+          <div className="space-y-5 min-w-0">
             <div>
               <h3 className="text-xs font-semibold text-slate-900 dark:text-slate-100 mb-2">
                 Unresolved Decisions ({allOpenDecisions.length})
@@ -619,7 +633,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                     return (
                       <div
                         key={dec.decisionId}
-                        className="border border-amber-300 dark:border-amber-800 bg-amber-50/40 dark:bg-amber-950/20 rounded-md p-3.5 text-xs"
+                        className="border border-amber-300 dark:border-amber-800 bg-amber-50/40 dark:bg-amber-950/20 rounded-md p-3.5 text-xs min-w-0 break-words [overflow-wrap:anywhere]"
                       >
                         <div className="flex flex-wrap items-center gap-2 text-slate-600 dark:text-slate-400 mb-1">
                           <span className="font-semibold text-amber-900 dark:text-amber-300">
@@ -639,7 +653,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                           {dec.contextSummary}
                         </p>
 
-                        <div className="grid grid-cols-1 gap-2 mb-2.5">
+                        <div className="grid grid-cols-1 gap-2 mb-2.5 min-w-0">
                           {dec.options && dec.options.length > 0 && (
                             <select
                               aria-label="Select decision option"
@@ -651,7 +665,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                                   [dec.decisionId]: e.target.value,
                                 }))
                               }
-                              className="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100"
+                              className="w-full max-w-full min-w-0 min-h-[34px] bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100"
                             >
                               {dec.options.map((opt) => (
                                 <option key={opt} value={opt}>
@@ -671,7 +685,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                                 [dec.decisionId]: e.target.value,
                               }))
                             }
-                            className="bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100"
+                            className="w-full min-w-0 min-h-[34px] bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1.5 text-xs text-slate-900 dark:text-slate-100"
                           />
                         </div>
 
@@ -686,7 +700,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                               noteVal || 'Resolved in Side Panel'
                             )
                           }
-                          className="px-3 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded disabled:opacity-40 cursor-pointer"
+                          className="min-h-[34px] px-3 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded disabled:opacity-40 cursor-pointer"
                         >
                           Record Decision Resolution
                         </button>
@@ -697,26 +711,26 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
               )}
             </div>
 
-            <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-5">
+            <div className="pt-4 border-t border-slate-200 dark:border-slate-800 space-y-5 min-w-0">
               <div>
                 <h3 className="text-xs font-semibold text-slate-900 dark:text-slate-100 mb-2">
                   Operator Notes ({project.notes.length})
                 </h3>
-                <form onSubmit={handleNoteSubmit} className="flex gap-2 mb-3">
+                <form onSubmit={handleNoteSubmit} className="flex flex-wrap sm:flex-nowrap gap-2 mb-3">
                   <input
                     type="text"
                     placeholder="Add a persistent operator note..."
                     value={noteInput}
                     disabled={!capabilities.canAddNote}
                     onChange={(e) => setNoteInput(e.target.value)}
-                    className="flex-1 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-3 py-1.5 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-600 disabled:opacity-50"
+                    className="flex-1 min-w-0 min-h-[34px] text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-3 py-1.5 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-600 disabled:opacity-50"
                   />
                   <button
                     type="submit"
                     disabled={!capabilities.canAddNote || !noteInput.trim()}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded disabled:opacity-40 whitespace-nowrap shrink-0 cursor-pointer"
+                    className="min-h-[34px] inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded disabled:opacity-40 cursor-pointer"
                   >
-                    <MessageSquarePlus className="w-3.5 h-3.5" />
+                    <MessageSquarePlus className="w-3.5 h-3.5 shrink-0" />
                     <span>Add Note</span>
                   </button>
                 </form>
@@ -726,7 +740,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                     {project.notes.map((n) => (
                       <div
                         key={n.noteId}
-                        className="border border-slate-200 dark:border-slate-800 rounded p-2.5 text-xs"
+                        className="border border-slate-200 dark:border-slate-800 rounded p-2.5 text-xs min-w-0 break-words [overflow-wrap:anywhere]"
                       >
                         <div className="flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400 mb-0.5">
                           <span className="font-semibold text-slate-800 dark:text-slate-200">
@@ -751,22 +765,27 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                   Distinguishes command acceptance from actual recipient delivery acknowledgment.
                 </p>
 
-                <form onSubmit={handleReminderSubmit} className="flex gap-2 mb-3">
+                <form
+                  onSubmit={handleReminderSubmit}
+                  className="flex flex-wrap sm:flex-nowrap gap-2 mb-3 min-w-0"
+                >
                   <input
                     type="text"
                     placeholder={`Message to ${project.owner}...`}
                     value={reminderMessage}
                     disabled={!capabilities.canSendReminder}
                     onChange={(e) => setReminderMessage(e.target.value)}
-                    className="flex-1 text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-3 py-1.5 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-600 disabled:opacity-50"
+                    className="flex-1 min-w-0 min-h-[34px] text-xs bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-3 py-1.5 text-slate-900 dark:text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-600 disabled:opacity-50"
                   />
                   <button
                     type="submit"
                     disabled={!capabilities.canSendReminder}
-                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-900 dark:text-slate-100 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-40 whitespace-nowrap shrink-0 cursor-pointer"
+                    className="min-h-[34px] max-w-full min-w-0 inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-900 dark:text-slate-100 bg-slate-100 dark:bg-slate-800 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-200 dark:hover:bg-slate-700 disabled:opacity-40 break-words [overflow-wrap:anywhere] text-left cursor-pointer"
                   >
-                    <Bell className="w-3.5 h-3.5" />
-                    <span>Remind {project.owner}</span>
+                    <Bell className="w-3.5 h-3.5 shrink-0" />
+                    <span className="min-w-0 break-words [overflow-wrap:anywhere]">
+                      Remind {project.owner}
+                    </span>
                   </button>
                 </form>
 
@@ -775,7 +794,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                     {project.reminders.map((rem) => (
                       <div
                         key={rem.reminderId}
-                        className={`border rounded p-2.5 text-xs ${
+                        className={`border rounded p-2.5 text-xs min-w-0 break-words [overflow-wrap:anywhere] ${
                           rem.status === 'acknowledged'
                             ? 'border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900/40'
                             : rem.status === 'accepted_pending_delivery'
@@ -783,8 +802,8 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
                             : 'border-red-200 dark:border-red-900/60 bg-red-50/40 dark:bg-red-950/20'
                         }`}
                       >
-                        <div className="flex items-center justify-between gap-2 mb-0.5">
-                          <span className="font-semibold text-slate-900 dark:text-slate-100">
+                        <div className="flex flex-wrap items-center justify-between gap-2 mb-0.5">
+                          <span className="font-semibold text-slate-900 dark:text-slate-100 min-w-0 break-words [overflow-wrap:anywhere]">
                             To: {rem.targetOwner} ({rem.deliveryChannel})
                           </span>
                           <span

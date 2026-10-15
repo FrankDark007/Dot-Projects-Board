@@ -1452,13 +1452,60 @@ export function validateSnapshotPayload(
 }
 
 /**
+ * Verifies whether a reminder's `deliveryAck` is bound to the requested `targetOwner`
+ * either by exact recipient match or by an explicit, verified canonical identity mapping.
+ */
+export function isDeliveryAckBoundToRequestedRecipient(
+  ack: NonNullable<OperatorCommandResponse['deliveryAck']>,
+  requestedOwner: string
+): boolean {
+  if (!isNonEmptyString(requestedOwner) || !isNonEmptyString(ack.recipient)) {
+    return false;
+  }
+
+  const hasValidStructuredMapping =
+    ack.canonicalIdentityMapping !== undefined &&
+    ack.canonicalIdentityMapping.requestedRecipient === requestedOwner &&
+    ack.canonicalIdentityMapping.canonicalRecipient === ack.recipient &&
+    ack.canonicalIdentityMapping.verified === true;
+
+  const hasValidFlatMapping =
+    ack.requestedRecipient === requestedOwner && ack.canonicalMappingVerified === true;
+
+  // If optional canonical mapping metadata is present, it must never be unverified or mismatched
+  if (ack.canonicalIdentityMapping !== undefined && !hasValidStructuredMapping) {
+    return false;
+  }
+  if (
+    ack.requestedRecipient !== undefined &&
+    ack.requestedRecipient !== requestedOwner
+  ) {
+    return false;
+  }
+  if (ack.canonicalMappingVerified === false) {
+    return false;
+  }
+
+  if (ack.recipient === requestedOwner) {
+    return true;
+  }
+
+  return hasValidStructuredMapping || hasValidFlatMapping;
+}
+
+/**
  * Validates a live backend's OperatorCommandResponse against HTTP status, request identity,
- * idempotencyKey, revision numbers, and delivery acknowledgment semantics.
+ * idempotencyKey, revision numbers, contradictory success/rejection/error fields,
+ * and recipient-bound delivery acknowledgment semantics.
  *
  * Guarantees:
  * - An HTTP error status (`!httpOk`) with `{ ok: true }` is ALWAYS rejected as contradictory.
  * - A mismatched `idempotencyKey`, `commandType`, or `projectId` is ALWAYS rejected.
- * - `send_reminder` with `ok: true` requires a valid `deliveryAck` object.
+ * - Contradictory fields (`ok: true` with `commandAccepted: false`, `ok: true` with `errorCode`
+ *   or `errorMessage` or `deliveryAck.error`, `commandAccepted: false` with `newRevision` or
+ *   `acknowledgedAt` or positive delivery outcomes) are ALWAYS rejected.
+ * - `send_reminder` with `ok: true` requires a valid `deliveryAck` object whose `recipient`
+ *   matches `req.command.targetOwner` or carries an explicit verified canonical identity mapping.
  * - `deliveryAck.outcome` of `failed_delivery` or `uncertain_timeout` cannot claim `ok: true` or `acknowledged: true`.
  */
 export function validateCommandResponsePayload(
@@ -1534,10 +1581,6 @@ export function validateCommandResponsePayload(
     };
   }
 
-  if (httpOk && raw.ok === false) {
-    // Backend returned 200 with ok:false; still treat as failure, validating errorCode
-  }
-
   if (
     raw.commandAccepted !== undefined &&
     typeof raw.commandAccepted !== 'boolean'
@@ -1548,6 +1591,58 @@ export function validateCommandResponsePayload(
       commandAccepted: false,
       errorCode: 'VALIDATION_ERROR',
       errorMessage: 'Command response commandAccepted must be a boolean when provided.',
+    };
+  }
+
+  // Contradiction check: ok: true with commandAccepted: false must NEVER become success
+  if (raw.ok === true && raw.commandAccepted === false) {
+    return {
+      ok: false,
+      idempotencyKey: req.idempotencyKey,
+      commandAccepted: false,
+      errorCode: 'VALIDATION_ERROR',
+      errorMessage:
+        'Contradictory command response: ok:true cannot be paired with commandAccepted:false.',
+    };
+  }
+
+  // Validate errorCode and errorMessage types and reject contradictory presence when ok: true
+  if (raw.errorCode !== undefined) {
+    if (
+      typeof raw.errorCode !== 'string' ||
+      !VALID_COMMAND_ERROR_CODES.has(raw.errorCode as CommandErrorCode)
+    ) {
+      return {
+        ok: false,
+        idempotencyKey: req.idempotencyKey,
+        commandAccepted: false,
+        errorCode: 'VALIDATION_ERROR',
+        errorMessage: `Unsupported or malformed command errorCode "${String(raw.errorCode)}".`,
+      };
+    }
+  }
+
+  if (raw.errorMessage !== undefined && !isNonEmptyString(raw.errorMessage)) {
+    return {
+      ok: false,
+      idempotencyKey: req.idempotencyKey,
+      commandAccepted: false,
+      errorCode: 'VALIDATION_ERROR',
+      errorMessage:
+        'Command response errorMessage must be a non-empty string when provided.',
+    };
+  }
+
+  // Contradiction check: ok: true cannot include errorCode (e.g. DELIVERY_FAILED) or errorMessage
+  if (raw.ok === true && (raw.errorCode !== undefined || raw.errorMessage !== undefined)) {
+    return {
+      ok: false,
+      idempotencyKey: req.idempotencyKey,
+      commandAccepted: false,
+      errorCode: 'VALIDATION_ERROR',
+      errorMessage: `Contradictory command response: ok:true cannot include error fields (errorCode="${String(
+        raw.errorCode ?? ''
+      )}", errorMessage="${String(raw.errorMessage ?? '')}").`,
     };
   }
 
@@ -1589,7 +1684,22 @@ export function validateCommandResponsePayload(
     };
   }
 
-  // Validate deliveryAck when present (or required on send_reminder success)
+  // Contradiction check: commandAccepted: false cannot claim newRevision or acknowledgedAt
+  if (
+    raw.commandAccepted === false &&
+    (raw.newRevision !== undefined || raw.acknowledgedAt !== undefined)
+  ) {
+    return {
+      ok: false,
+      idempotencyKey: req.idempotencyKey,
+      commandAccepted: false,
+      errorCode: 'VALIDATION_ERROR',
+      errorMessage:
+        'Contradictory command response: commandAccepted:false cannot report newRevision or acknowledgedAt.',
+    };
+  }
+
+  // Validate deliveryAck when present (or required on send_reminder)
   let validatedDeliveryAck: OperatorCommandResponse['deliveryAck'] | undefined;
   if (raw.deliveryAck !== undefined) {
     if (!isRecord(raw.deliveryAck)) {
@@ -1647,31 +1757,118 @@ export function validateCommandResponsePayload(
       };
     }
 
+    if (ack.error !== undefined && !isNonEmptyString(ack.error)) {
+      return {
+        ok: false,
+        idempotencyKey: req.idempotencyKey,
+        commandAccepted: false,
+        errorCode: 'VALIDATION_ERROR',
+        errorMessage: 'Command response deliveryAck.error must be a non-empty string when provided.',
+      };
+    }
+
+    if ((raw.ok === true || ack.acknowledged === true) && ack.error !== undefined) {
+      return {
+        ok: false,
+        idempotencyKey: req.idempotencyKey,
+        commandAccepted: false,
+        errorCode: 'VALIDATION_ERROR',
+        errorMessage:
+          'Contradictory deliveryAck: ok:true or acknowledged:true cannot include deliveryAck.error.',
+      };
+    }
+
+    // Validate optional canonical identity mapping fields
+    let validatedCanonicalMapping:
+      | NonNullable<OperatorCommandResponse['deliveryAck']>['canonicalIdentityMapping']
+      | undefined;
+
+    if (ack.canonicalIdentityMapping !== undefined) {
+      if (
+        !isRecord(ack.canonicalIdentityMapping) ||
+        !isNonEmptyString(ack.canonicalIdentityMapping.requestedRecipient) ||
+        !isNonEmptyString(ack.canonicalIdentityMapping.canonicalRecipient) ||
+        typeof ack.canonicalIdentityMapping.verified !== 'boolean'
+      ) {
+        return {
+          ok: false,
+          idempotencyKey: req.idempotencyKey,
+          commandAccepted: false,
+          errorCode: 'VALIDATION_ERROR',
+          errorMessage:
+            'Command response deliveryAck.canonicalIdentityMapping must contain non-empty requestedRecipient, canonicalRecipient, and boolean verified.',
+        };
+      }
+      validatedCanonicalMapping = {
+        requestedRecipient: ack.canonicalIdentityMapping.requestedRecipient,
+        canonicalRecipient: ack.canonicalIdentityMapping.canonicalRecipient,
+        verified: ack.canonicalIdentityMapping.verified,
+      };
+    }
+
+    if (
+      ack.requestedRecipient !== undefined &&
+      !isNonEmptyString(ack.requestedRecipient)
+    ) {
+      return {
+        ok: false,
+        idempotencyKey: req.idempotencyKey,
+        commandAccepted: false,
+        errorCode: 'VALIDATION_ERROR',
+        errorMessage:
+          'Command response deliveryAck.requestedRecipient must be a non-empty string when provided.',
+      };
+    }
+
+    if (
+      ack.canonicalMappingVerified !== undefined &&
+      typeof ack.canonicalMappingVerified !== 'boolean'
+    ) {
+      return {
+        ok: false,
+        idempotencyKey: req.idempotencyKey,
+        commandAccepted: false,
+        errorCode: 'VALIDATION_ERROR',
+        errorMessage:
+          'Command response deliveryAck.canonicalMappingVerified must be a boolean when provided.',
+      };
+    }
+
     const outcome: DeliveryOutcome =
       (ack.outcome as DeliveryOutcome | undefined) ??
       (ack.acknowledged ? 'delivered_acknowledged' : 'failed_delivery');
 
-    // Enforce semantic consistency between outcome, acknowledged, ackId, and top-level ok
+    // Enforce semantic consistency between outcome, acknowledged, ackId, commandAccepted, and top-level ok
     if (outcome === 'delivered_acknowledged') {
-      if (!ack.acknowledged || !isNonEmptyString(ack.ackId)) {
+      if (
+        !ack.acknowledged ||
+        !isNonEmptyString(ack.ackId) ||
+        raw.ok !== true ||
+        raw.commandAccepted === false
+      ) {
         return {
           ok: false,
           idempotencyKey: req.idempotencyKey,
           commandAccepted: false,
           errorCode: 'VALIDATION_ERROR',
           errorMessage:
-            'Contradictory deliveryAck: outcome "delivered_acknowledged" requires acknowledged=true and non-empty ackId.',
+            'Contradictory deliveryAck: outcome "delivered_acknowledged" requires ok=true, commandAccepted!=false, acknowledged=true, and non-empty ackId.',
         };
       }
     } else if (outcome === 'accepted_pending_delivery') {
-      if (ack.acknowledged) {
+      if (
+        ack.acknowledged ||
+        ack.ackId !== null ||
+        raw.ok !== true ||
+        raw.commandAccepted === false
+      ) {
         return {
           ok: false,
           idempotencyKey: req.idempotencyKey,
           commandAccepted: false,
           errorCode: 'VALIDATION_ERROR',
           errorMessage:
-            'Contradictory deliveryAck: outcome "accepted_pending_delivery" cannot have acknowledged=true.',
+            'Contradictory deliveryAck: outcome "accepted_pending_delivery" requires ok=true, commandAccepted!=false, acknowledged=false, and ackId=null.',
         };
       }
     } else if (outcome === 'failed_delivery' || outcome === 'uncertain_timeout') {
@@ -1686,14 +1883,32 @@ export function validateCommandResponsePayload(
       }
     }
 
-    validatedDeliveryAck = {
+    const candidateAck: NonNullable<OperatorCommandResponse['deliveryAck']> = {
       acknowledged: ack.acknowledged,
       outcome,
       ackId: ack.ackId as string | null,
       channel: ack.channel,
       recipient: ack.recipient,
+      requestedRecipient: ack.requestedRecipient as string | undefined,
+      canonicalMappingVerified: ack.canonicalMappingVerified as boolean | undefined,
+      canonicalIdentityMapping: validatedCanonicalMapping,
       error: typeof ack.error === 'string' ? ack.error : undefined,
     };
+
+    // Bind reminder acknowledgment to requested targetOwner or explicit verified canonical identity mapping
+    if (req.command.type === 'send_reminder') {
+      if (!isDeliveryAckBoundToRequestedRecipient(candidateAck, req.command.targetOwner)) {
+        return {
+          ok: false,
+          idempotencyKey: req.idempotencyKey,
+          commandAccepted: false,
+          errorCode: 'VALIDATION_ERROR',
+          errorMessage: `Command response deliveryAck.recipient mismatch: requested "${req.command.targetOwner}", received "${ack.recipient}" without an explicit verified canonical identity mapping.`,
+        };
+      }
+    }
+
+    validatedDeliveryAck = candidateAck;
   } else if (httpOk && raw.ok === true && req.command.type === 'send_reminder') {
     return {
       ok: false,
@@ -1735,10 +1950,11 @@ export function validateCommandResponsePayload(
     idempotencyKey: req.idempotencyKey,
     commandType: req.command.type,
     projectId: req.command.projectId,
-    commandAccepted: raw.commandAccepted ?? true,
+    commandAccepted: true,
     deduplicatedReplay: raw.deduplicatedReplay as boolean | undefined,
     newRevision: raw.newRevision as number | undefined,
     acknowledgedAt: raw.acknowledgedAt as string | undefined,
     deliveryAck: validatedDeliveryAck,
   };
 }
+

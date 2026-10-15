@@ -3,6 +3,7 @@
  * @description Alternate Project Card view displaying truthful status, owner, current milestone,
  * next action, remaining steps, latest useful result, blocker, separate confirmed-running vs
  * unknown worker counts, cost coverage, and expandable workflow diagram.
+ * Enforces `min-w-0`, wrapping for long project/owner/unbroken strings, and accessible controls.
  */
 
 import React, { useState } from 'react';
@@ -121,7 +122,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
       parts.push(`${workerSummary.stalledProgressCount} alive (stalled progress)`);
     }
     if (workerSummary.unknownExecutionCount > 0) {
-      parts.push(`${workerSummary.unknownExecutionCount} unknown (heartbeat expired)`);
+      parts.push(`${workerSummary.unknownExecutionCount} unknown (heartbeat/source expired)`);
     }
     if (workerSummary.crashedOrFailedCount > 0) {
       parts.push(`${workerSummary.crashedOrFailedCount} crashed/failed`);
@@ -135,24 +136,26 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
   return (
     <article
       aria-label={`Project: ${project.name}`}
-      className={`bg-white dark:bg-[#111827] border rounded-lg p-5 transition-colors ${
+      className={`@container bg-white dark:bg-[#111827] border rounded-lg p-5 transition-colors ${
         isSelected
           ? 'border-sky-600 dark:border-sky-500'
           : 'border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700'
       }`}
     >
       {/* Top Row: Status + Metadata + Priority & Detail Actions */}
-      <div className="flex flex-col md:flex-row md:items-start justify-between gap-4 mb-3.5">
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2 text-xs mb-1">
-            <span className={`inline-flex items-center gap-1.5 ${getStatusTextClass()}`}>
+      <div className="grid grid-cols-1 @[760px]:grid-cols-[minmax(0,1fr)_auto] gap-4 mb-3.5 items-start">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs mb-1 min-w-0">
+            <span className={`inline-flex items-center gap-1.5 min-w-0 ${getStatusTextClass()}`}>
               {getStatusIcon()}
-              <span>{primaryStatusLabel}</span>
+              <span className="min-w-0 break-words [overflow-wrap:anywhere]">
+                {primaryStatusLabel}
+              </span>
             </span>
             <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
               ·
             </span>
-            <span className="text-slate-600 dark:text-slate-400">
+            <span className="text-slate-600 dark:text-slate-400 min-w-0 break-words [overflow-wrap:anywhere]">
               Owner:{' '}
               <strong className="font-medium text-slate-900 dark:text-slate-100">
                 {project.owner}
@@ -161,7 +164,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
             <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
               ·
             </span>
-            <span className="font-mono text-slate-500 dark:text-slate-400 tabular-nums">
+            <span className="font-mono text-slate-500 dark:text-slate-400 tabular-nums min-w-0 break-words [overflow-wrap:anywhere]">
               Last verified update: {formatRelativeAge(lastVerifiedUpdateAt, referenceNowIso)}
             </span>
             {project.archived && (
@@ -176,23 +179,23 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
             )}
           </div>
 
-          <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100 tracking-tight">
+          <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100 tracking-tight min-w-0">
             <button
               type="button"
               onClick={() => onSelectProject(project.projectId)}
-              className="text-left hover:text-sky-600 dark:hover:text-sky-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-600 rounded cursor-pointer"
+              className="text-left hover:text-sky-600 dark:hover:text-sky-400 focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-600 rounded cursor-pointer min-w-0 break-words [overflow-wrap:anywhere] whitespace-normal"
             >
               {project.name}
             </button>
           </h3>
-          <p className="text-xs text-slate-600 dark:text-slate-400 mt-1">
+          <p className="text-xs text-slate-600 dark:text-slate-400 mt-1 min-w-0 break-words [overflow-wrap:anywhere]">
             {project.currentScope}
           </p>
         </div>
 
         {/* Right Controls */}
-        <div className="flex items-center gap-2 shrink-0">
-          <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
+          <div className="flex items-center gap-1.5 min-w-0">
             <label
               htmlFor={`card-prio-${project.projectId}`}
               className="text-xs text-slate-500 dark:text-slate-400 whitespace-nowrap"
@@ -211,7 +214,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
               onChange={(e) =>
                 onChangePriority(project.projectId, e.target.value as PriorityLevel)
               }
-              className="text-xs font-medium bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2 py-1 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-sky-600 disabled:opacity-50 cursor-pointer"
+              className="min-h-[34px] max-w-full text-xs font-medium bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1.5 text-slate-800 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-sky-600 disabled:opacity-50 cursor-pointer"
             >
               <option value="critical">Critical</option>
               <option value="high">High</option>
@@ -223,9 +226,9 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
           <button
             type="button"
             onClick={() => onSelectProject(project.projectId)}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-900 dark:text-slate-100 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className="min-h-[34px] inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-900 dark:text-slate-100 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors cursor-pointer"
           >
-            <PanelRightOpen className="w-3.5 h-3.5" />
+            <PanelRightOpen className="w-3.5 h-3.5 shrink-0" />
             <span>Open Side Panel</span>
           </button>
         </div>
@@ -233,7 +236,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
 
       {/* Contradicted Completion Claim Warning */}
       {inconsistentCompletionClaim && completionContradictionReason && (
-        <div className="bg-amber-50/80 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/60 rounded-md p-3 mb-3.5 text-xs text-amber-950 dark:text-amber-200">
+        <div className="bg-amber-50/80 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900/60 rounded-md p-3 mb-3.5 text-xs text-amber-950 dark:text-amber-200 min-w-0 break-words [overflow-wrap:anywhere]">
           <span className="font-semibold">Unverified Completion Claim: </span>
           <span>{completionContradictionReason}</span>
         </div>
@@ -241,7 +244,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
 
       {/* Explicit Warning if Agent Turn Finished but Acceptance Gate Failed */}
       {executionFinishedButAcceptanceFailed && (
-        <div className="bg-red-50/70 dark:bg-red-950/30 border border-red-200 dark:border-red-900/60 rounded-md p-3 mb-3.5 text-xs text-red-900 dark:text-red-200">
+        <div className="bg-red-50/70 dark:bg-red-950/30 border border-red-200 dark:border-red-900/60 rounded-md p-3 mb-3.5 text-xs text-red-900 dark:text-red-200 min-w-0 break-words [overflow-wrap:anywhere]">
           <span className="font-semibold">
             Confirmed Failure — Execution turn finished, but project is NOT complete:{' '}
           </span>
@@ -255,14 +258,14 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
       {/* Blocker / Needs You Callout */}
       {(project.blocker || openDecisionsForMe.length > 0) && (
         <div
-          className={`rounded-md p-3 mb-3.5 border text-xs ${
+          className={`rounded-md p-3 mb-3.5 border text-xs min-w-0 break-words [overflow-wrap:anywhere] ${
             project.blocker?.isConfirmedFailure
               ? 'bg-red-50/50 dark:bg-red-950/20 border-red-200 dark:border-red-900/50'
               : 'bg-amber-50/50 dark:bg-amber-950/20 border-amber-200 dark:border-amber-900/50'
           }`}
         >
           {project.blocker && (
-            <div className="text-slate-900 dark:text-slate-100 mb-1.5 last:mb-0">
+            <div className="text-slate-900 dark:text-slate-100 mb-1.5 last:mb-0 min-w-0 break-words [overflow-wrap:anywhere]">
               <span
                 className={`font-semibold ${
                   project.blocker.isConfirmedFailure
@@ -284,9 +287,9 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
           {openDecisionsForMe.map((dec) => (
             <div
               key={dec.decisionId}
-              className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1.5 first:pt-0 border-t first:border-t-0 border-slate-200/70 dark:border-slate-800"
+              className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1.5 first:pt-0 border-t first:border-t-0 border-slate-200/70 dark:border-slate-800 min-w-0"
             >
-              <div>
+              <div className="min-w-0 break-words [overflow-wrap:anywhere]">
                 <span className="font-semibold text-amber-900 dark:text-amber-300">
                   Needs You:{' '}
                 </span>
@@ -297,7 +300,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
               <button
                 type="button"
                 onClick={() => onSelectProject(project.projectId)}
-                className="text-xs font-semibold text-sky-700 dark:text-sky-400 hover:underline whitespace-nowrap shrink-0 cursor-pointer"
+                className="text-xs font-semibold text-sky-700 dark:text-sky-400 hover:underline shrink-0 cursor-pointer text-left"
               >
                 Answer in Panel
               </button>
@@ -308,7 +311,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
 
       {/* Core 4-Column Operational Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 py-3.5 border-t border-b border-slate-200 dark:border-slate-800 text-xs">
-        <div>
+        <div className="min-w-0 break-words [overflow-wrap:anywhere]">
           <div className="text-slate-500 dark:text-slate-400 mb-1">
             Current Milestone & Scope
           </div>
@@ -321,14 +324,14 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
           </div>
         </div>
 
-        <div>
+        <div className="min-w-0 break-words [overflow-wrap:anywhere]">
           <div className="text-slate-500 dark:text-slate-400 mb-1">Next Action</div>
           <div className="text-slate-900 dark:text-slate-100 leading-snug">
             {project.nextAction}
           </div>
         </div>
 
-        <div>
+        <div className="min-w-0 break-words [overflow-wrap:anywhere]">
           <div className="text-slate-500 dark:text-slate-400 mb-1">
             Latest Verified Useful Result
           </div>
@@ -348,7 +351,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
           )}
         </div>
 
-        <div>
+        <div className="min-w-0 break-words [overflow-wrap:anywhere]">
           <div className="text-slate-500 dark:text-slate-400 mb-1">
             Workers, Gates & Cost Coverage
           </div>
@@ -366,22 +369,22 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
       </div>
 
       {/* Bottom Action Bar */}
-      <div className="flex flex-wrap items-center justify-between gap-3 pt-3 text-xs">
-        <div className="flex flex-wrap items-center gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-3 pt-3 text-xs min-w-0">
+        <div className="flex flex-wrap items-center gap-3 min-w-0">
           <button
             type="button"
             onClick={() => setWorkflowExpanded((prev) => !prev)}
             aria-expanded={workflowExpanded}
-            className="inline-flex items-center gap-1.5 font-medium text-slate-700 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white cursor-pointer whitespace-nowrap shrink-0"
+            className="min-h-[34px] inline-flex items-center gap-1.5 font-medium text-slate-700 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white cursor-pointer text-left min-w-0 break-words [overflow-wrap:anywhere]"
           >
             {workflowExpanded ? (
               <>
-                <ChevronUp className="w-4 h-4" />
+                <ChevronUp className="w-4 h-4 shrink-0" />
                 <span>Hide Workflow & Acceptance Gates</span>
               </>
             ) : (
               <>
-                <ChevronDown className="w-4 h-4" />
+                <ChevronDown className="w-4 h-4 shrink-0" />
                 <span>
                   Expand Workflow & Acceptance Gates ({project.milestones.length} milestones)
                 </span>
@@ -394,7 +397,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
               <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
                 ·
               </span>
-              <span className="font-mono text-slate-600 dark:text-slate-400 tabular-nums">
+              <span className="font-mono text-slate-600 dark:text-slate-400 tabular-nums min-w-0 break-words [overflow-wrap:anywhere]">
                 Deployed: {project.deployedRevision.versionOrSha} (
                 {project.deployedRevision.environment})
               </span>
@@ -402,7 +405,7 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
           <button
             type="button"
             disabled={!capabilities.canSendReminder}
@@ -418,10 +421,12 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
                 `Status check requested on ${project.name}: ${project.nextAction}`
               )
             }
-            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap shrink-0 cursor-pointer"
+            className="min-h-[34px] max-w-full min-w-0 inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed break-words [overflow-wrap:anywhere] text-left cursor-pointer"
           >
-            <Bell className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
-            <span>Remind {project.owner}</span>
+            <Bell className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
+            <span className="min-w-0 break-words [overflow-wrap:anywhere]">
+              Remind {project.owner}
+            </span>
           </button>
 
           <button
@@ -435,16 +440,16 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
                 : 'Archive project (does not delete files or cancel running jobs)'
             }
             onClick={() => onToggleArchive(project.projectId, !project.archived)}
-            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed whitespace-nowrap shrink-0 cursor-pointer"
+            className="min-h-[34px] inline-flex items-center gap-1.5 px-2.5 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
           >
             {project.archived ? (
               <>
-                <ArchiveRestore className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
+                <ArchiveRestore className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
                 <span>Unarchive</span>
               </>
             ) : (
               <>
-                <Archive className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400" />
+                <Archive className="w-3.5 h-3.5 text-slate-500 dark:text-slate-400 shrink-0" />
                 <span>Archive</span>
               </>
             )}
@@ -452,8 +457,9 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
         </div>
       </div>
 
+      {/* Expandable Workflow Diagram */}
       {workflowExpanded && (
-        <div className="mt-4">
+        <div className="mt-3">
           <WorkflowDiagram
             milestones={project.milestones}
             currentMilestoneId={project.currentMilestoneId}

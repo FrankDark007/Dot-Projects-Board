@@ -18,6 +18,8 @@ import {
   List,
   Menu,
   Moon,
+  PanelLeftClose,
+  PanelLeftOpen,
   RefreshCw,
   Search,
   ShieldAlert,
@@ -58,6 +60,8 @@ import {
   OperatorCommandRequest,
   PriorityLevel,
 } from './schema/contract';
+import { isDeliveryAckBoundToRequestedRecipient } from './schema/validator';
+import type { RecordedAsyncVerificationReport } from './tests/recordedVerificationReport';
 import { formatRelativeAge, formatUtcShort } from './utils/timeFormat';
 
 type NavSection =
@@ -83,6 +87,7 @@ export interface AppProps {
   initialLiveConfig?: LiveAdapterConfig;
   liveFetchImpl?: FetchLike;
   getNowIso?: () => string;
+  loadAsyncVerificationReportImpl?: () => Promise<RecordedAsyncVerificationReport>;
 }
 
 export default function App({
@@ -90,6 +95,7 @@ export default function App({
   initialLiveConfig = DEFAULT_LIVE_CONFIG,
   liveFetchImpl,
   getNowIso,
+  loadAsyncVerificationReportImpl,
 }: AppProps) {
   // Demo controller is strictly isolated to Demo Mode
   const demoControllerRef = useRef<MissionControlDataController>(
@@ -142,6 +148,7 @@ export default function App({
   const [liveWarningOrError, setLiveWarningOrError] = useState<string | null>(null);
   // Transport contact timestamp is tracked strictly separately from snapshot.generatedAt
   const [liveLastContactAt, setLiveLastContactAt] = useState<string | null>(null);
+  const [liveInitialDataRejected, setLiveInitialDataRejected] = useState<boolean>(false);
   const [consecutiveFailures, setConsecutiveFailures] = useState<number>(0);
   const consecutiveFailuresRef = useRef<number>(0);
   const [isPollingLive, setIsPollingLive] = useState<boolean>(false);
@@ -161,6 +168,7 @@ export default function App({
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [adapterModalOpen, setAdapterModalOpen] = useState<boolean>(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState<boolean>(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(false);
   const [diagnosticsExpanded, setDiagnosticsExpanded] = useState<boolean>(false);
   const [feedbackBanner, setFeedbackBanner] = useState<ActionFeedbackBanner | null>(null);
 
@@ -294,6 +302,10 @@ export default function App({
       setLiveConnectionHealth(outcome.connectionHealth);
       setLiveWarningOrError(outcome.warningOrError);
       setLiveLastContactAt(outcome.lastSuccessfulContactAt);
+      setLiveInitialDataRejected(
+        outcome.status === 'rejected_validation_preserved_last' &&
+          outcome.snapshot === null
+      );
 
       let nextFailures = consecutiveFailuresRef.current;
       if (outcome.status === 'updated') {
@@ -369,6 +381,7 @@ export default function App({
     setLiveConnectionHealth('never_connected');
     setLiveWarningOrError(null);
     setLiveLastContactAt(null);
+    setLiveInitialDataRejected(false);
     consecutiveFailuresRef.current = 0;
     setConsecutiveFailures(0);
     setSelectedProjectId(null);
@@ -408,14 +421,21 @@ export default function App({
     [resetLiveEndpointStateAndInvalidate]
   );
 
-  // Separate transport reachability (`liveLastContactAt`) from snapshot data freshness (`liveSnapshot.generatedAt`)
-  const liveDataFreshness = useMemo(() => {
-    if (mode !== 'live' || !liveSnapshot) return null;
-    return evaluateSnapshotDataFreshness(liveSnapshot, referenceNowIso, liveConfig);
-  }, [mode, liveSnapshot, referenceNowIso, liveConfig]);
+  const activeSnapshot: MissionControlSnapshot | null =
+    mode === 'demo' ? demoSnapshot : liveSnapshot;
+
+  // Separate transport reachability (`liveLastContactAt`), snapshot envelope generation age (`snapshot.generatedAt`),
+  // worker source observation age (`worker.source.observedAt`), and static project metadata age (`project.source.observedAt`)
+  const activeDataFreshness = useMemo(() => {
+    if (!activeSnapshot) return null;
+    return evaluateSnapshotDataFreshness(activeSnapshot, referenceNowIso, liveConfig);
+  }, [activeSnapshot, referenceNowIso, liveConfig]);
+
+  const liveDataFreshness = mode === 'live' ? activeDataFreshness : null;
 
   // Determine effective connection health:
   // Repeated HTTP 200 responses serving an old snapshot (`!liveDataFreshness.isDataFresh`) evaluate as `'stale'`!
+  // Old static project metadata (`project.source.observedAt`) alone never implies a failed or stale connection.
   const effectiveConnectionHealth: ConnectionHealthState = useMemo(() => {
     if (mode === 'demo') return 'demo_synthetic';
     if (!liveSnapshot || liveConnectionHealth === 'never_connected') {
@@ -438,11 +458,11 @@ export default function App({
     if (liveDataFreshness && !liveDataFreshness.isDataFresh) {
       return liveDataFreshness.reason;
     }
+    if (liveDataFreshness && !liveDataFreshness.areAllWorkerSourcesFresh) {
+      return liveDataFreshness.workerSourcesReason;
+    }
     return null;
   }, [liveWarningOrError, liveDataFreshness]);
-
-  const activeSnapshot: MissionControlSnapshot | null =
-    mode === 'demo' ? demoSnapshot : liveSnapshot;
 
   // Evaluate all projects against `referenceNowIso`
   const allEvaluatedProjects = useMemo(() => {
@@ -684,7 +704,25 @@ export default function App({
           return;
         }
 
-        if (liveRes.ok) {
+        const hasContradictoryLiveFields =
+          liveRes.commandAccepted === false ||
+          liveRes.errorCode !== undefined ||
+          liveRes.errorMessage !== undefined ||
+          liveRes.deliveryAck?.error !== undefined ||
+          liveRes.deliveryAck?.outcome === 'failed_delivery' ||
+          liveRes.deliveryAck?.outcome === 'uncertain_timeout';
+
+        const hasValidLiveReminderBinding =
+          req.command.type !== 'send_reminder' ||
+          Boolean(
+            liveRes.deliveryAck &&
+              isDeliveryAckBoundToRequestedRecipient(
+                liveRes.deliveryAck,
+                req.command.targetOwner
+              )
+          );
+
+        if (liveRes.ok && !hasContradictoryLiveFields && hasValidLiveReminderBinding) {
           if (liveRes.deliveryAck?.outcome === 'accepted_pending_delivery') {
             setFeedbackBanner({
               id: liveRes.idempotencyKey,
@@ -692,10 +730,15 @@ export default function App({
               message: `Command accepted by backend; downstream delivery to ${liveRes.deliveryAck.recipient} is still pending acknowledgment.`,
             });
           } else if (liveRes.deliveryAck?.outcome === 'delivered_acknowledged') {
+            const recipientDesc =
+              req.command.type === 'send_reminder' &&
+              liveRes.deliveryAck.recipient !== req.command.targetOwner
+                ? `${liveRes.deliveryAck.recipient} (verified canonical identity for ${req.command.targetOwner})`
+                : liveRes.deliveryAck.recipient;
             setFeedbackBanner({
               id: liveRes.idempotencyKey,
               tone: 'success',
-              message: `Live reminder delivered and acknowledged by ${liveRes.deliveryAck.recipient} via ${liveRes.deliveryAck.channel} (Ack: ${liveRes.deliveryAck.ackId}).`,
+              message: `Live reminder delivered and acknowledged by ${recipientDesc} via ${liveRes.deliveryAck.channel} (Ack: ${liveRes.deliveryAck.ackId}).`,
             });
           } else {
             setFeedbackBanner({
@@ -713,7 +756,7 @@ export default function App({
             tone: liveRes.errorCode === 'UNCERTAIN_WRITE_TIMEOUT' ? 'warning' : 'danger',
             message:
               liveRes.errorMessage ||
-              'Live command rejected by backend. Demo controller was not invoked.',
+              'Live command rejected by validation or backend. Demo controller was not invoked.',
           });
         }
         return;
@@ -723,7 +766,25 @@ export default function App({
       const res = demoControllerRef.current.executeCommand(req);
       setDemoSnapshot(demoControllerRef.current.getSnapshot());
 
-      if (res.ok) {
+      const hasContradictoryDemoFields =
+        res.commandAccepted === false ||
+        res.errorCode !== undefined ||
+        res.errorMessage !== undefined ||
+        res.deliveryAck?.error !== undefined ||
+        res.deliveryAck?.outcome === 'failed_delivery' ||
+        res.deliveryAck?.outcome === 'uncertain_timeout';
+
+      const hasValidDemoReminderBinding =
+        req.command.type !== 'send_reminder' ||
+        Boolean(
+          res.deliveryAck &&
+            isDeliveryAckBoundToRequestedRecipient(
+              res.deliveryAck,
+              req.command.targetOwner
+            )
+        );
+
+      if (res.ok && !hasContradictoryDemoFields && hasValidDemoReminderBinding) {
         if (req.command.type === 'send_reminder') {
           if (res.deliveryAck?.outcome === 'delivered_acknowledged') {
             setFeedbackBanner({
@@ -981,8 +1042,8 @@ export default function App({
           aria-label="Synthetic Demo Data Notice"
           className="bg-slate-900 dark:bg-slate-950 text-slate-100 px-4 py-2 text-xs border-b border-slate-800"
         >
-          <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2">
+          <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-2 min-w-0">
+            <div className="flex flex-wrap items-center gap-2 min-w-0">
               <Database className="w-3.5 h-3.5 text-amber-400 shrink-0" />
               <span className="font-mono font-semibold tracking-wide text-amber-300">
                 SYNTHETIC DEMO DATA
@@ -990,7 +1051,7 @@ export default function App({
               <span aria-hidden="true" className="text-slate-600">
                 ·
               </span>
-              <span className="text-slate-300">
+              <span className="text-slate-300 min-w-0 break-words [overflow-wrap:anywhere]">
                 Sanitized fixtures for evaluation ({demoControllerRef.current.getDroppedDuplicatesCount()}{' '}
                 duplicate event deduplicated). Not connected to local Macs or MD workers.
                 {demoClockOffsetSeconds > 0
@@ -998,11 +1059,11 @@ export default function App({
                   : ''}
               </span>
             </div>
-            <div className="flex items-center gap-3 shrink-0">
+            <div className="flex flex-wrap items-center gap-3 min-w-0">
               <button
                 type="button"
                 onClick={() => setDemoClockOffsetSeconds((s) => s + 120)}
-                className="text-slate-300 hover:text-white underline underline-offset-4 cursor-pointer"
+                className="min-h-[28px] text-slate-300 hover:text-white underline underline-offset-4 cursor-pointer"
               >
                 Advance Demo Clock +2m
               </button>
@@ -1012,7 +1073,7 @@ export default function App({
               <button
                 type="button"
                 onClick={() => handleSwitchMode('live')}
-                className="font-medium text-amber-300 hover:text-white underline underline-offset-4 whitespace-nowrap cursor-pointer"
+                className="min-h-[28px] font-medium text-amber-300 hover:text-white underline underline-offset-4 cursor-pointer"
               >
                 Switch to Live Adapter Mode
               </button>
@@ -1027,25 +1088,37 @@ export default function App({
           aria-label="Live Adapter Not Connected"
           className="bg-red-950 text-red-100 px-4 py-2 text-xs border-b border-red-900"
         >
-          <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-3">
-            <div className="flex flex-wrap items-center gap-2">
+          <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-2 min-w-0">
+            <div className="flex flex-wrap items-center gap-2 min-w-0">
               <WifiOff className="w-3.5 h-3.5 text-red-400 shrink-0" />
               <span className="font-mono font-semibold text-red-300">
-                LIVE MODE — NOT CONNECTED
+                {liveInitialDataRejected
+                  ? 'LIVE MODE — ENDPOINT REACHABLE · INVALID INITIAL DATA REJECTED'
+                  : 'LIVE MODE — NOT CONNECTED'}
               </span>
               <span aria-hidden="true" className="text-red-700">
                 ·
               </span>
-              <span>
+              <span className="min-w-0 break-words [overflow-wrap:anywhere]">
+                {liveLastContactAt ? (
+                  <>
+                    Last HTTP contact:{' '}
+                    <strong className="font-mono tabular-nums">
+                      {formatRelativeAge(liveLastContactAt, referenceNowIso)}
+                    </strong>
+                    {' · '}
+                  </>
+                ) : null}
                 No valid snapshot received from{' '}
-                <code className="font-mono">{liveConfig.endpointBaseUrl}</code>. Synthetic
+                <code className="font-mono break-all">{liveConfig.endpointBaseUrl}</code>. Synthetic
                 demo fixtures are never substituted for a failed live feed.
+                {effectiveLiveWarning ? ` (${effectiveLiveWarning})` : ''}
               </span>
             </div>
             <button
               type="button"
               onClick={() => handleSwitchMode('demo')}
-              className="font-medium text-red-200 hover:text-white underline underline-offset-4 whitespace-nowrap cursor-pointer"
+              className="min-h-[28px] font-medium text-red-200 hover:text-white underline underline-offset-4 cursor-pointer"
             >
               Return to Demo Fixtures
             </button>
@@ -1055,24 +1128,29 @@ export default function App({
 
       {mode === 'live' &&
         (effectiveConnectionHealth === 'stale' ||
-          effectiveConnectionHealth === 'disconnected') && (
+          effectiveConnectionHealth === 'disconnected' ||
+          (liveDataFreshness && !liveDataFreshness.areAllWorkerSourcesFresh)) && (
           <div
             role="region"
             aria-label="Stale or Disconnected Live Feed Warning"
             className="bg-amber-950 text-amber-100 px-4 py-2 text-xs border-b border-amber-900"
           >
-            <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-3">
-              <div className="flex flex-wrap items-center gap-2">
+            <div className="max-w-[1600px] mx-auto flex flex-wrap items-center justify-between gap-2 min-w-0">
+              <div className="flex flex-wrap items-center gap-2 min-w-0">
                 <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                 <span className="font-mono font-semibold text-amber-300">
                   {effectiveConnectionHealth === 'disconnected'
                     ? 'LIVE FEED DISCONNECTED — SHOWING PRESERVED SNAPSHOT'
-                    : 'STALE LIVE FEED WARNING'}
+                    : effectiveConnectionHealth === 'stale'
+                    ? effectiveLiveWarning?.includes('Endpoint reachable')
+                      ? 'STALE LIVE FEED WARNING · ENDPOINT REACHABLE (INVALID DATA REJECTED)'
+                      : 'STALE LIVE FEED WARNING'
+                    : 'STALE WORKER SOURCE OBSERVATION WARNING'}
                 </span>
                 <span aria-hidden="true" className="text-amber-700">
                   ·
                 </span>
-                <span>
+                <span className="min-w-0 break-words [overflow-wrap:anywhere]">
                   Snapshot generated:{' '}
                   <strong className="font-mono tabular-nums">
                     {formatRelativeAge(liveSnapshot?.generatedAt, referenceNowIso)}
@@ -1082,13 +1160,23 @@ export default function App({
                   <strong className="font-mono tabular-nums">
                     {formatRelativeAge(liveLastContactAt, referenceNowIso)}
                   </strong>
+                  {' · '}
+                  Worker source (oldest):{' '}
+                  <strong className="font-mono tabular-nums">
+                    {liveDataFreshness?.oldestWorkerSourceObservedAt
+                      ? formatRelativeAge(
+                          liveDataFreshness.oldestWorkerSourceObservedAt,
+                          referenceNowIso
+                        )
+                      : 'N/A'}
+                  </strong>
                   {effectiveLiveWarning ? ` (${effectiveLiveWarning})` : ''}.
                 </span>
               </div>
               <button
                 type="button"
                 onClick={() => void performLivePoll()}
-                className="font-medium text-amber-200 hover:text-white underline underline-offset-4 whitespace-nowrap cursor-pointer"
+                className="min-h-[28px] font-medium text-amber-200 hover:text-white underline underline-offset-4 cursor-pointer"
               >
                 Retry Poll Now
               </button>
@@ -1096,31 +1184,59 @@ export default function App({
           </div>
         )}
 
-      {/* 2. Workspace Shell: Compact Sidebar + Main Content Area */}
-      <div className="flex-1 flex max-w-[1600px] w-full mx-auto">
-        {/* Compact Left Sidebar (Desktop) */}
+      {/* 2. Workspace Shell: Collapsible Left Sidebar + Main Content Area */}
+      <div className="flex-1 flex max-w-[1600px] w-full mx-auto min-w-0">
+        {/* Collapsible Left Sidebar (Desktop) */}
         <aside
+          data-testid="desktop-sidebar"
+          data-collapsed={sidebarCollapsed ? 'true' : 'false'}
           aria-label="Workspace Navigation"
-          className="hidden md:flex md:w-56 shrink-0 flex-col border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-3.5 justify-between"
+          className={`hidden md:flex ${
+            sidebarCollapsed ? 'md:w-16' : 'md:w-56'
+          } shrink-0 flex-col border-r border-slate-200 dark:border-slate-800 bg-white dark:bg-[#111827] p-3 justify-between transition-all`}
         >
-          <div className="space-y-5">
-            {/* Brand */}
-            <div className="px-2 pt-1">
-              <div className="text-sm font-bold tracking-tight text-slate-900 dark:text-white">
-                dot · Projects Board
-              </div>
-              <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 mt-0.5">
-                {mode === 'demo'
-                  ? 'Mode: Demo Fixtures'
-                  : `Mode: Live (${effectiveConnectionHealth})`}
-              </div>
+          <div className="space-y-5 min-w-0">
+            {/* Brand + Collapse Toggle */}
+            <div
+              className={`flex items-start ${
+                sidebarCollapsed ? 'justify-center' : 'justify-between'
+              } gap-2 px-1 pt-1 min-w-0`}
+            >
+              {!sidebarCollapsed && (
+                <div className="min-w-0">
+                  <div className="text-sm font-bold tracking-tight text-slate-900 dark:text-white break-words">
+                    dot · Projects Board
+                  </div>
+                  <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 mt-0.5 break-words">
+                    {mode === 'demo'
+                      ? 'Mode: Demo Fixtures'
+                      : `Mode: Live (${effectiveConnectionHealth})`}
+                  </div>
+                </div>
+              )}
+              <button
+                type="button"
+                data-testid="desktop-sidebar-toggle"
+                onClick={() => setSidebarCollapsed((c) => !c)}
+                aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+                title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+                className="min-h-[34px] min-w-[34px] p-1.5 inline-flex items-center justify-center text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800 rounded cursor-pointer shrink-0"
+              >
+                {sidebarCollapsed ? (
+                  <PanelLeftOpen className="w-4 h-4 shrink-0" />
+                ) : (
+                  <PanelLeftClose className="w-4 h-4 shrink-0" />
+                )}
+              </button>
             </div>
 
             {/* Primary Views */}
-            <nav aria-label="Primary Views" className="space-y-1 text-xs">
-              <div className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
-                Workspace
-              </div>
+            <nav aria-label="Primary Views" className="space-y-1 text-xs min-w-0">
+              {!sidebarCollapsed && (
+                <div className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
+                  Workspace
+                </div>
+              )}
               {(
                 [
                   {
@@ -1163,19 +1279,23 @@ export default function App({
                     key={item.id}
                     type="button"
                     onClick={() => setActiveNav(item.id)}
-                    className={`w-full flex items-center justify-between px-2.5 py-2 rounded-md font-medium transition-colors cursor-pointer ${
+                    aria-label={item.label}
+                    title={item.label}
+                    className={`min-h-[34px] w-full flex items-center ${
+                      sidebarCollapsed ? 'justify-center px-1.5' : 'justify-between px-2.5'
+                    } py-2 rounded-md font-medium transition-colors cursor-pointer min-w-0 ${
                       isActive
                         ? 'bg-slate-900 dark:bg-sky-600 text-white'
                         : 'text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800/70'
                     }`}
                   >
-                    <span className="inline-flex items-center gap-2 truncate">
+                    <span className="inline-flex items-center gap-2 min-w-0">
                       <Icon className="w-3.5 h-3.5 shrink-0" />
-                      <span className="truncate">{item.label}</span>
+                      {!sidebarCollapsed && <span className="truncate">{item.label}</span>}
                     </span>
-                    {item.badge !== undefined && (
+                    {!sidebarCollapsed && item.badge !== undefined && (
                       <span
-                        className={`font-mono text-[11px] tabular-nums ${
+                        className={`font-mono text-[11px] tabular-nums shrink-0 ml-1 ${
                           isActive
                             ? 'text-slate-200 dark:text-sky-100'
                             : 'text-slate-400 dark:text-slate-500'
@@ -1189,9 +1309,9 @@ export default function App({
               })}
             </nav>
 
-            {/* Quick Status Filters */}
-            {activeSnapshot && (
-              <div className="space-y-1 text-xs pt-3 border-t border-slate-200 dark:border-slate-800">
+            {/* Quick Status Filters (shown when sidebar is expanded) */}
+            {activeSnapshot && !sidebarCollapsed && (
+              <div className="space-y-1 text-xs pt-3 border-t border-slate-200 dark:border-slate-800 min-w-0">
                 <div className="px-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-slate-400 dark:text-slate-500">
                   Status Filters
                 </div>
@@ -1219,14 +1339,14 @@ export default function App({
                         setActiveNav('board_overview');
                         setSelectedBucket(bKey);
                       }}
-                      className={`w-full flex items-center justify-between px-2.5 py-1.5 rounded-md transition-colors cursor-pointer ${
+                      className={`min-h-[32px] w-full flex items-center justify-between px-2.5 py-1.5 rounded-md transition-colors cursor-pointer min-w-0 ${
                         isSelected
                           ? 'bg-slate-100 dark:bg-slate-800 font-semibold text-slate-900 dark:text-white'
                           : 'text-slate-600 dark:text-slate-400 hover:bg-slate-50 dark:hover:bg-slate-900'
                       }`}
                     >
-                      <span>{bLabel}</span>
-                      <span className="font-mono text-[11px] tabular-nums text-slate-500 dark:text-slate-400">
+                      <span className="truncate">{bLabel}</span>
+                      <span className="font-mono text-[11px] tabular-nums text-slate-500 dark:text-slate-400 shrink-0 ml-1">
                         {bCount}
                       </span>
                     </button>
@@ -1237,42 +1357,52 @@ export default function App({
           </div>
 
           {/* Sidebar Footer: Connection & Clock Summary */}
-          <div className="pt-4 border-t border-slate-200 dark:border-slate-800 px-2 text-[11px] text-slate-500 dark:text-slate-400 space-y-1">
-            <div className="flex items-center gap-1.5 font-medium text-slate-700 dark:text-slate-300">
+          <div className="pt-4 border-t border-slate-200 dark:border-slate-800 px-1 text-[11px] text-slate-500 dark:text-slate-400 space-y-1 min-w-0">
+            <div
+              className={`flex items-center ${
+                sidebarCollapsed ? 'justify-center' : 'gap-1.5'
+              } font-medium text-slate-700 dark:text-slate-300 min-w-0`}
+            >
               {mode === 'demo' ? (
                 <>
                   <Database className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                  <span>Demo Fixtures</span>
+                  {!sidebarCollapsed && <span className="truncate">Demo Fixtures</span>}
                 </>
               ) : effectiveConnectionHealth === 'connected' ? (
                 <>
                   <Wifi className="w-3.5 h-3.5 text-teal-500 shrink-0" />
-                  <span>Connected (Fresh)</span>
+                  {!sidebarCollapsed && <span className="truncate">Connected (Fresh)</span>}
                 </>
               ) : effectiveConnectionHealth === 'stale' ? (
                 <>
                   <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                  <span>Stale Snapshot</span>
+                  {!sidebarCollapsed && <span className="truncate">Stale Snapshot</span>}
                 </>
               ) : (
                 <>
                   <WifiOff className="w-3.5 h-3.5 text-red-500 shrink-0" />
-                  <span>{effectiveConnectionHealth.replace('_', ' ')}</span>
+                  {!sidebarCollapsed && (
+                    <span className="truncate">
+                      {effectiveConnectionHealth.replace('_', ' ')}
+                    </span>
+                  )}
                 </>
               )}
             </div>
-            <div className="font-mono tabular-nums text-[10px]">
-              Clock: {formatUtcShort(referenceNowIso)}
-            </div>
+            {!sidebarCollapsed && (
+              <div className="font-mono tabular-nums text-[10px] break-words">
+                Clock: {formatUtcShort(referenceNowIso)}
+              </div>
+            )}
           </div>
         </aside>
 
         {/* Mobile Drawer Sidebar */}
         {mobileSidebarOpen && (
           <div className="fixed inset-0 z-50 md:hidden flex">
-            <div className="w-64 bg-white dark:bg-[#111827] border-r border-slate-200 dark:border-slate-800 p-4 flex flex-col justify-between">
+            <div className="w-64 max-w-[85vw] bg-white dark:bg-[#111827] border-r border-slate-200 dark:border-slate-800 p-4 flex flex-col justify-between overflow-y-auto">
               <div className="space-y-4">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2">
                   <span className="text-sm font-bold text-slate-900 dark:text-white">
                     dot · Projects Board
                   </span>
@@ -1280,7 +1410,7 @@ export default function App({
                     type="button"
                     onClick={() => setMobileSidebarOpen(false)}
                     aria-label="Close navigation menu"
-                    className="p-1 text-slate-500"
+                    className="min-h-[34px] min-w-[34px] p-1 inline-flex items-center justify-center text-slate-500 cursor-pointer"
                   >
                     <X className="w-4 h-4" />
                   </button>
@@ -1303,7 +1433,7 @@ export default function App({
                         setActiveNav(id);
                         setMobileSidebarOpen(false);
                       }}
-                      className={`w-full text-left px-3 py-2 rounded-md font-medium ${
+                      className={`min-h-[36px] w-full text-left px-3 py-2 rounded-md font-medium cursor-pointer ${
                         activeNav === id
                           ? 'bg-slate-900 dark:bg-sky-600 text-white'
                           : 'text-slate-700 dark:text-slate-300'
@@ -1325,22 +1455,22 @@ export default function App({
         {/* Right Main Column: Clean Header + Workspace Content */}
         <div className="flex-1 flex flex-col min-w-0">
           {/* Top Header */}
-          <header className="bg-white dark:bg-[#111827] border-b border-slate-200 dark:border-slate-800 px-4 sm:px-6 py-3">
-            <div className="flex flex-wrap items-center justify-between gap-3">
+          <header className="bg-white dark:bg-[#111827] border-b border-slate-200 dark:border-slate-800 px-4 sm:px-6 py-3 min-w-0">
+            <div className="flex flex-wrap items-center justify-between gap-3 min-w-0">
               {/* Left: Mobile Menu Trigger + View Title + Separate Snapshot Observation vs Contact Status */}
-              <div className="flex items-center gap-3 min-w-0">
+              <div className="flex items-center gap-3 min-w-0 flex-1">
                 <button
                   type="button"
                   onClick={() => setMobileSidebarOpen(true)}
                   aria-label="Open navigation menu"
-                  className="md:hidden p-1.5 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded"
+                  className="md:hidden min-h-[34px] min-w-[34px] p-1.5 inline-flex items-center justify-center text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 rounded shrink-0 cursor-pointer"
                 >
                   <Menu className="w-4 h-4" />
                 </button>
 
-                <div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h1 className="text-sm font-bold text-slate-900 dark:text-white tracking-tight">
+                <div className="min-w-0">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 min-w-0">
+                    <h1 className="text-sm font-bold text-slate-900 dark:text-white tracking-tight min-w-0 break-words [overflow-wrap:anywhere]">
                       {activeNav === 'board_overview'
                         ? 'Command Center Board'
                         : activeNav === 'today_focus'
@@ -1356,20 +1486,49 @@ export default function App({
                     <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
                       ·
                     </span>
-                    <span className="text-xs font-mono text-slate-500 dark:text-slate-400 tabular-nums">
+                    <span className="text-xs font-mono text-slate-500 dark:text-slate-400 tabular-nums min-w-0 break-words [overflow-wrap:anywhere]">
                       {mode === 'demo'
-                        ? `Demo snapshot (${formatRelativeAge(
+                        ? `Demo snapshot (Generated: ${formatRelativeAge(
                             activeSnapshot?.generatedAt,
                             referenceNowIso
-                          )})`
+                          )} · Worker source oldest: ${
+                            activeDataFreshness?.oldestWorkerSourceObservedAt
+                              ? formatRelativeAge(
+                                  activeDataFreshness.oldestWorkerSourceObservedAt,
+                                  referenceNowIso
+                                )
+                              : 'N/A'
+                          }${
+                            activeDataFreshness &&
+                            activeDataFreshness.staleWorkerSourceCount > 0
+                              ? ` · ${activeDataFreshness.staleWorkerSourceCount} stale`
+                              : ''
+                          })`
                         : activeSnapshot
-                        ? `Snapshot observed: ${formatRelativeAge(
+                        ? `Envelope generated: ${formatRelativeAge(
                             activeSnapshot.generatedAt,
                             referenceNowIso
                           )} · HTTP contact: ${formatRelativeAge(
                             liveLastContactAt,
                             referenceNowIso
-                          )}`
+                          )} · Worker source oldest: ${
+                            activeDataFreshness?.oldestWorkerSourceObservedAt
+                              ? formatRelativeAge(
+                                  activeDataFreshness.oldestWorkerSourceObservedAt,
+                                  referenceNowIso
+                                )
+                              : 'N/A'
+                          }${
+                            activeDataFreshness &&
+                            activeDataFreshness.staleWorkerSourceCount > 0
+                              ? ` (${activeDataFreshness.staleWorkerSourceCount} stale)`
+                              : ''
+                          }`
+                        : liveInitialDataRejected
+                        ? `Live: Endpoint reachable (HTTP contact: ${formatRelativeAge(
+                            liveLastContactAt,
+                            referenceNowIso
+                          )} · No valid snapshot accepted)`
                         : 'Live: Never connected'}
                     </span>
                   </div>
@@ -1377,18 +1536,18 @@ export default function App({
               </div>
 
               {/* Right Controls: Search + Row/Card Toggle + Theme Switch + Adapter Button */}
-              <div className="flex flex-wrap items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2 min-w-0 max-w-full">
                 {(activeNav === 'board_overview' || activeNav === 'archived') && (
                   <>
-                    <div className="relative w-48 sm:w-60">
-                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                    <div className="relative flex-1 sm:flex-initial w-44 sm:w-60 min-w-[140px] max-w-full">
+                      <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
                       <input
                         type="search"
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
                         placeholder="Search projects, steps..."
                         aria-label="Search projects"
-                        className="w-full text-xs bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded pl-8 pr-2.5 py-1.5 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-600"
+                        className="min-h-[34px] w-full text-xs bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded pl-8 pr-2.5 py-1.5 text-slate-900 dark:text-slate-100 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-sky-600"
                       />
                     </div>
 
@@ -1396,32 +1555,32 @@ export default function App({
                     <div
                       role="group"
                       aria-label="Project layout view"
-                      className="inline-flex items-center p-0.5 bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded"
+                      className="inline-flex items-center p-0.5 bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded shrink-0"
                     >
                       <button
                         type="button"
                         onClick={() => setDisplayLayout('rows')}
                         title="Compact Rows (Default)"
-                        className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-xs cursor-pointer ${
+                        className={`min-h-[30px] inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-xs cursor-pointer ${
                           displayLayout === 'rows'
                             ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-2xs'
                             : 'text-slate-600 dark:text-slate-400'
                         }`}
                       >
-                        <List className="w-3.5 h-3.5" />
+                        <List className="w-3.5 h-3.5 shrink-0" />
                         <span>Rows</span>
                       </button>
                       <button
                         type="button"
                         onClick={() => setDisplayLayout('cards')}
                         title="Expanded Cards"
-                        className={`inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded-xs cursor-pointer ${
+                        className={`min-h-[30px] inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-xs cursor-pointer ${
                           displayLayout === 'cards'
                             ? 'bg-white dark:bg-slate-800 text-slate-900 dark:text-white shadow-2xs'
                             : 'text-slate-600 dark:text-slate-400'
                         }`}
                       >
-                        <LayoutGrid className="w-3.5 h-3.5" />
+                        <LayoutGrid className="w-3.5 h-3.5 shrink-0" />
                         <span>Cards</span>
                       </button>
                     </div>
@@ -1436,7 +1595,7 @@ export default function App({
                     theme === 'light' ? 'Switch to dark theme' : 'Switch to light theme'
                   }
                   title={theme === 'light' ? 'Switch to Dark Theme' : 'Switch to Light Theme'}
-                  className="p-1.5 text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded hover:bg-slate-200 dark:hover:bg-slate-800 cursor-pointer"
+                  className="min-h-[34px] min-w-[34px] p-1.5 inline-flex items-center justify-center text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded hover:bg-slate-200 dark:hover:bg-slate-800 shrink-0 cursor-pointer"
                 >
                   {theme === 'light' ? (
                     <Moon className="w-3.5 h-3.5" />
@@ -1449,9 +1608,9 @@ export default function App({
                 <button
                   type="button"
                   onClick={() => setAdapterModalOpen(true)}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-slate-900 dark:bg-sky-600 hover:bg-slate-800 dark:hover:bg-sky-700 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                  className="min-h-[34px] inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-slate-900 dark:bg-sky-600 hover:bg-slate-800 dark:hover:bg-sky-700 rounded transition-colors shrink-0 cursor-pointer"
                 >
-                  <Sliders className="w-3.5 h-3.5" />
+                  <Sliders className="w-3.5 h-3.5 shrink-0" />
                   <span>Adapter &amp; Mode</span>
                 </button>
               </div>
@@ -1459,12 +1618,12 @@ export default function App({
           </header>
 
           {/* Main Workspace Scroll Area */}
-          <main className="flex-1 p-4 sm:p-6 max-w-full overflow-x-hidden">
+          <main className="flex-1 p-4 sm:p-6 min-w-0 max-w-full overflow-x-hidden">
             {/* Action Feedback / Undo Banner */}
             {feedbackBanner && (
               <div
                 role="status"
-                className={`flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 rounded-lg border mb-5 text-xs ${
+                className={`flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 rounded-lg border mb-5 text-xs min-w-0 ${
                   feedbackBanner.tone === 'success'
                     ? 'bg-teal-50 dark:bg-teal-950/40 border-teal-200 dark:border-teal-900 text-teal-950 dark:text-teal-200'
                     : feedbackBanner.tone === 'danger'
@@ -1472,7 +1631,7 @@ export default function App({
                     : 'bg-amber-50 dark:bg-amber-950/40 border-amber-200 dark:border-amber-900 text-amber-950 dark:text-amber-200'
                 }`}
               >
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 min-w-0">
                   {feedbackBanner.tone === 'success' ? (
                     <CheckCircle2 className="w-4 h-4 text-teal-700 dark:text-teal-400 shrink-0" />
                   ) : feedbackBanner.tone === 'danger' ? (
@@ -1480,9 +1639,11 @@ export default function App({
                   ) : (
                     <AlertTriangle className="w-4 h-4 text-amber-700 dark:text-amber-400 shrink-0" />
                   )}
-                  <span className="font-medium">{feedbackBanner.message}</span>
+                  <span className="font-medium min-w-0 break-words [overflow-wrap:anywhere]">
+                    {feedbackBanner.message}
+                  </span>
                 </div>
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 shrink-0">
                   {feedbackBanner.undoProjectId !== undefined &&
                     feedbackBanner.undoTargetArchiveState !== undefined && (
                       <button
@@ -1493,7 +1654,7 @@ export default function App({
                             feedbackBanner.undoTargetArchiveState!
                           )
                         }
-                        className="inline-flex items-center gap-1 font-semibold underline underline-offset-4 cursor-pointer"
+                        className="min-h-[28px] inline-flex items-center gap-1 font-semibold underline underline-offset-4 cursor-pointer"
                       >
                         <Undo2 className="w-3.5 h-3.5" />
                         <span>Undo</span>
@@ -1502,7 +1663,7 @@ export default function App({
                   <button
                     type="button"
                     onClick={() => setFeedbackBanner(null)}
-                    className="text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white cursor-pointer"
+                    className="min-h-[28px] text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white cursor-pointer"
                   >
                     Dismiss
                   </button>
@@ -1512,21 +1673,21 @@ export default function App({
 
             {/* LIVE MODE: NOT CONNECTED EMPTY STATE (Never substitutes synthetic data!) */}
             {mode === 'live' && !activeSnapshot ? (
-              <section className="bg-white dark:bg-[#111827] border border-slate-300 dark:border-slate-800 rounded-xl p-8 text-center max-w-xl mx-auto my-8">
+              <section className="bg-white dark:bg-[#111827] border border-slate-300 dark:border-slate-800 rounded-xl p-6 sm:p-8 text-center max-w-xl mx-auto my-8 min-w-0">
                 <WifiOff className="w-9 h-9 text-red-600 dark:text-red-400 mx-auto mb-3" />
-                <h2 className="text-lg font-bold text-slate-900 dark:text-white mb-1.5">
+                <h2 className="text-lg font-bold text-slate-900 dark:text-white mb-1.5 break-words">
                   Not Connected to Local Mission Control
                 </h2>
-                <p className="text-xs text-slate-600 dark:text-slate-400 mb-4 leading-relaxed">
+                <p className="text-xs text-slate-600 dark:text-slate-400 mb-4 leading-relaxed break-words [overflow-wrap:anywhere]">
                   Live Mode is active and waiting for a verified{' '}
                   <code className="font-mono">{CONTRACT_SCHEMA_VERSION}</code> snapshot from{' '}
-                  <code className="font-mono bg-slate-100 dark:bg-slate-900 px-1.5 py-0.5 rounded">
+                  <code className="font-mono bg-slate-100 dark:bg-slate-900 px-1.5 py-0.5 rounded break-all">
                     {liveConfig.endpointBaseUrl}/snapshot
                   </code>
                   . Synthetic demo fixtures are never displayed in Live Mode.
                 </p>
                 {effectiveLiveWarning && (
-                  <div className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 rounded p-3 text-xs font-mono text-red-800 dark:text-red-300 mb-5 text-left">
+                  <div className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 rounded p-3 text-xs font-mono text-red-800 dark:text-red-300 mb-5 text-left break-words [overflow-wrap:anywhere]">
                     {effectiveLiveWarning} (Failed attempts: {consecutiveFailures})
                   </div>
                 )}
@@ -1535,7 +1696,7 @@ export default function App({
                     type="button"
                     disabled={isPollingLive}
                     onClick={() => void performLivePoll()}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded disabled:opacity-50 cursor-pointer"
+                    className="min-h-[34px] inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded disabled:opacity-50 cursor-pointer"
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${isPollingLive ? 'animate-spin' : ''}`} />
                     <span>{isPollingLive ? 'Polling...' : 'Retry Live Connection'}</span>
@@ -1543,14 +1704,14 @@ export default function App({
                   <button
                     type="button"
                     onClick={() => setAdapterModalOpen(true)}
-                    className="px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 rounded hover:bg-slate-200 cursor-pointer"
+                    className="min-h-[34px] px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 rounded hover:bg-slate-200 cursor-pointer"
                   >
                     Configure Endpoint
                   </button>
                   <button
                     type="button"
                     onClick={() => handleSwitchMode('demo')}
-                    className="px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-900 cursor-pointer"
+                    className="min-h-[34px] px-3.5 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 border border-slate-300 dark:border-slate-700 rounded hover:bg-slate-50 dark:hover:bg-slate-900 cursor-pointer"
                   >
                     Switch to Demo Mode
                   </button>
@@ -1558,7 +1719,11 @@ export default function App({
               </section>
             ) : activeSnapshot ? (
               <>
-                {activeNav === 'contract_tests' && <ContractAndTestsView />}
+                {activeNav === 'contract_tests' && (
+                  <ContractAndTestsView
+                    loadAsyncReportImpl={loadAsyncVerificationReportImpl}
+                  />
+                )}
 
                 {activeNav === 'today_focus' && (
                   <TodayView
@@ -1591,7 +1756,7 @@ export default function App({
                 )}
 
                 {(activeNav === 'board_overview' || activeNav === 'archived') && (
-                  <div className="space-y-6">
+                  <div className="space-y-6 min-w-0">
                     {/* 1. Attention Panel at Top of Board Overview */}
                     {activeNav === 'board_overview' && (
                       <AttentionPanel
@@ -1606,24 +1771,24 @@ export default function App({
                       />
                     )}
 
-                    {/* Filter Bar: Segmented Status Pills + Owner & Priority Selectors */}
+                    {/* Filter Bar: Segmented Status Buttons + Constrained Owner & Priority Selectors */}
                     <section
                       aria-label="Filter Bar"
-                      className="flex flex-wrap items-center justify-between gap-3 bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg px-4 py-2.5"
+                      className="flex flex-wrap items-center justify-between gap-3 bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg px-4 py-2.5 min-w-0"
                     >
                       {activeNav === 'archived' ? (
-                        <div className="flex items-center gap-2 text-xs">
-                          <Archive className="w-4 h-4 text-slate-500" />
+                        <div className="flex flex-wrap items-center gap-2 text-xs min-w-0">
+                          <Archive className="w-4 h-4 text-slate-500 shrink-0" />
                           <span className="font-semibold text-slate-900 dark:text-slate-100">
                             Archived Projects ({archivedProjects.length})
                           </span>
-                          <span className="text-slate-500 dark:text-slate-400">
+                          <span className="text-slate-500 dark:text-slate-400 min-w-0 break-words">
                             — Unfinished work stays discoverable; archiving never deletes files
                             or cancels workers.
                           </span>
                         </div>
                       ) : (
-                        <div className="flex flex-wrap items-center gap-1">
+                        <div className="flex flex-wrap items-center gap-1 min-w-0">
                           {(
                             [
                               ['all', 'All', activeUnarchivedProjects.length],
@@ -1642,7 +1807,7 @@ export default function App({
                               key={bKey}
                               type="button"
                               onClick={() => setSelectedBucket(bKey)}
-                              className={`px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                              className={`min-h-[32px] px-2.5 py-1 text-xs font-medium rounded transition-colors cursor-pointer shrink-0 ${
                                 selectedBucket === bKey
                                   ? 'bg-slate-900 dark:bg-sky-600 text-white'
                                   : 'text-slate-600 dark:text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800'
@@ -1663,12 +1828,13 @@ export default function App({
                         </div>
                       )}
 
-                      <div className="flex flex-wrap items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2 min-w-0 max-w-full">
                         <select
                           aria-label="Filter by owner"
+                          data-testid="owner-filter-select"
                           value={ownerFilter}
                           onChange={(e) => setOwnerFilter(e.target.value)}
-                          className="text-xs bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1 text-slate-700 dark:text-slate-200"
+                          className="min-h-[34px] min-w-0 max-w-[220px] sm:max-w-[240px] truncate text-xs bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1 text-slate-700 dark:text-slate-200"
                         >
                           <option value="all">All Owners</option>
                           {uniqueOwners.map((o) => (
@@ -1680,9 +1846,10 @@ export default function App({
 
                         <select
                           aria-label="Filter by priority"
+                          data-testid="priority-filter-select"
                           value={priorityFilter}
                           onChange={(e) => setPriorityFilter(e.target.value)}
-                          className="text-xs bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1 text-slate-700 dark:text-slate-200"
+                          className="min-h-[34px] min-w-0 max-w-[180px] truncate text-xs bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1 text-slate-700 dark:text-slate-200"
                         >
                           <option value="all">All Priorities</option>
                           <option value="critical">Critical</option>
@@ -1710,22 +1877,25 @@ export default function App({
                             setPriorityFilter('all');
                             setSearchQuery('');
                           }}
-                          className="px-3 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded cursor-pointer"
+                          className="min-h-[34px] px-3 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded cursor-pointer"
                         >
                           Reset Filters
                         </button>
                       </div>
                     ) : activeNav === 'board_overview' && selectedBucket === 'all' ? (
-                      <div className="space-y-6">
+                      <div className="space-y-6 min-w-0">
                         {/* Section 1: Needs Attention / Blocked First */}
                         {hierarchySections.attentionOrBlocked.length > 0 && (
-                          <section aria-label="Blocked and Needs Attention Projects">
-                            <div className="flex items-center justify-between mb-2 px-1">
-                              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
+                          <section
+                            aria-label="Blocked and Needs Attention Projects"
+                            className="min-w-0"
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-1.5 mb-2 px-1 min-w-0">
+                              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400 min-w-0 break-words">
                                 1. Blocked &amp; Needs Attention (
                                 {hierarchySections.attentionOrBlocked.length})
                               </h2>
-                              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                              <span className="text-[11px] text-slate-500 dark:text-slate-400 min-w-0 break-words">
                                 Confirmed failures, stalled progress, or pending operator decisions
                               </span>
                             </div>
@@ -1735,13 +1905,13 @@ export default function App({
 
                         {/* Section 2: Current Work Second */}
                         {hierarchySections.currentWork.length > 0 && (
-                          <section aria-label="Currently Running Projects">
-                            <div className="flex items-center justify-between mb-2 px-1">
-                              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
+                          <section aria-label="Currently Running Projects" className="min-w-0">
+                            <div className="flex flex-wrap items-center justify-between gap-1.5 mb-2 px-1 min-w-0">
+                              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400 min-w-0 break-words">
                                 2. Current Work — Confirmed Running (
                                 {hierarchySections.currentWork.length})
                               </h2>
-                              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                              <span className="text-[11px] text-slate-500 dark:text-slate-400 min-w-0 break-words">
                                 Fresh worker heartbeats and verified progress
                               </span>
                             </div>
@@ -1751,13 +1921,16 @@ export default function App({
 
                         {/* Section 3: Unfinished Backlog & Verified Complete Third */}
                         {hierarchySections.backlogAndCompleted.length > 0 && (
-                          <section aria-label="Unfinished Backlog and Verified Complete Projects">
-                            <div className="flex items-center justify-between mb-2 px-1">
-                              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400">
+                          <section
+                            aria-label="Unfinished Backlog and Verified Complete Projects"
+                            className="min-w-0"
+                          >
+                            <div className="flex flex-wrap items-center justify-between gap-1.5 mb-2 px-1 min-w-0">
+                              <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-600 dark:text-slate-400 min-w-0 break-words">
                                 3. Unfinished Backlog &amp; Verified Complete (
                                 {hierarchySections.backlogAndCompleted.length})
                               </h2>
-                              <span className="text-[11px] text-slate-500 dark:text-slate-400">
+                              <span className="text-[11px] text-slate-500 dark:text-slate-400 min-w-0 break-words">
                                 Idle, queued, unknown coverage, or strictly verified complete
                               </span>
                             </div>
@@ -1772,14 +1945,14 @@ export default function App({
                     {/* Expandable Technical Diagnostics Section */}
                     <section
                       aria-label="Technical Diagnostics"
-                      className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg px-4 py-3"
+                      className="bg-white dark:bg-[#111827] border border-slate-200 dark:border-slate-800 rounded-lg px-4 py-3 min-w-0"
                     >
-                      <div className="flex items-center justify-between">
-                        <div className="text-xs text-slate-600 dark:text-slate-400">
+                      <div className="flex flex-wrap items-center justify-between gap-2 min-w-0">
+                        <div className="text-xs text-slate-600 dark:text-slate-400 min-w-0 break-words">
                           <span className="font-semibold text-slate-800 dark:text-slate-200">
                             Technical Diagnostics &amp; Thresholds
                           </span>
-                          <span className="ml-2 font-mono text-[11px]">
+                          <span className="ml-2 font-mono text-[11px] break-all">
                             Schema: {activeSnapshot.schemaVersion} · Snapshot:{' '}
                             {activeSnapshot.snapshotId}
                           </span>
@@ -1787,7 +1960,7 @@ export default function App({
                         <button
                           type="button"
                           onClick={() => setDiagnosticsExpanded((prev) => !prev)}
-                          className="inline-flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white cursor-pointer"
+                          className="min-h-[32px] inline-flex items-center gap-1 text-xs font-medium text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white cursor-pointer shrink-0"
                         >
                           {diagnosticsExpanded ? (
                             <>
@@ -1804,32 +1977,30 @@ export default function App({
                       </div>
 
                       {diagnosticsExpanded && (
-                        <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-800 grid grid-cols-1 sm:grid-cols-5 gap-3 text-xs font-mono text-slate-600 dark:text-slate-400">
-                          <div>
-                            <div className="text-[11px] text-slate-400">Heartbeat Expiry</div>
-                            <div>
-                              {activeSnapshot.evaluationThresholds.heartbeatExpirySeconds}s
-                            </div>
-                          </div>
-                          <div>
+                        <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-800 grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-6 gap-3 text-xs font-mono text-slate-600 dark:text-slate-400 min-w-0">
+                          <div className="min-w-0">
                             <div className="text-[11px] text-slate-400">
-                              Stalled Progress Limit
+                              Heartbeat / Progress Limits
                             </div>
                             <div>
-                              {activeSnapshot.evaluationThresholds.stalledProgressSeconds}s (
+                              HB &le;{activeSnapshot.evaluationThresholds.heartbeatExpirySeconds}s ·
+                              Prog &le;
                               {Math.floor(
                                 activeSnapshot.evaluationThresholds.stalledProgressSeconds / 60
                               )}
-                              m)
+                              m
                             </div>
                           </div>
-                          <div>
+                          <div className="min-w-0">
                             <div className="text-[11px] text-slate-400">
                               Snapshot Generated At
                             </div>
-                            <div>{formatUtcShort(activeSnapshot.generatedAt)}</div>
+                            <div>
+                              {formatUtcShort(activeSnapshot.generatedAt)} (
+                              {formatRelativeAge(activeSnapshot.generatedAt, referenceNowIso)})
+                            </div>
                           </div>
-                          <div>
+                          <div className="min-w-0">
                             <div className="text-[11px] text-slate-400">
                               Last HTTP Contact
                             </div>
@@ -1837,11 +2008,45 @@ export default function App({
                               {mode === 'demo'
                                 ? 'N/A (Demo)'
                                 : liveLastContactAt
-                                ? formatUtcShort(liveLastContactAt)
+                                ? `${formatUtcShort(liveLastContactAt)} (${formatRelativeAge(
+                                    liveLastContactAt,
+                                    referenceNowIso
+                                  )})`
                                 : 'None'}
                             </div>
                           </div>
-                          <div>
+                          <div className="min-w-0">
+                            <div className="text-[11px] text-slate-400">
+                              Worker Source Observation
+                            </div>
+                            <div
+                              className={
+                                activeDataFreshness &&
+                                activeDataFreshness.staleWorkerSourceCount > 0
+                                  ? 'text-amber-800 dark:text-amber-400 font-semibold'
+                                  : ''
+                              }
+                            >
+                              {activeDataFreshness?.oldestWorkerSourceObservedAt
+                                ? `Oldest ${formatRelativeAge(
+                                    activeDataFreshness.oldestWorkerSourceObservedAt,
+                                    referenceNowIso
+                                  )} · ${activeDataFreshness.staleWorkerSourceCount} stale`
+                                : 'No workers'}
+                            </div>
+                          </div>
+                          <div className="min-w-0">
+                            <div className="text-[11px] text-slate-400">
+                              Static Project Metadata Age
+                            </div>
+                            <div>
+                              {activeDataFreshness?.oldestProjectMetadataAgeSeconds !== null &&
+                              activeDataFreshness?.oldestProjectMetadataAgeSeconds !== undefined
+                                ? `Oldest ${activeDataFreshness.oldestProjectMetadataAgeSeconds}s (info only)`
+                                : 'N/A'}
+                            </div>
+                          </div>
+                          <div className="min-w-0">
                             <div className="text-[11px] text-slate-400">Command Capabilities</div>
                             <div>
                               {effectiveCapabilities.canChangePriority

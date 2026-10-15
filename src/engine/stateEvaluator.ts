@@ -27,6 +27,9 @@ export interface EvaluatedWorker extends WorkerRecord {
   isExecutionUnknown: boolean;
   heartbeatAgeSeconds: number | null;
   progressAgeSeconds: number | null;
+  sourceObservationAgeSeconds: number | null;
+  isSourceObservationFresh: boolean;
+  staleSourceObservation: boolean;
   timestampWarning?: string;
   statusExplanation: string;
 }
@@ -36,6 +39,7 @@ export interface ProjectWorkerSummary {
   hasUncertainWorkerCount: boolean;
   /**
    * Confirmed running/alive workers (includes both actively progressing and alive-but-stalled).
+   * Requires both a fresh heartbeat AND a fresh worker.source.observedAt observation.
    * Null when project-level worker coverage is unknown and zero workers are confirmed.
    */
   confirmedRunningCount: number | null;
@@ -49,18 +53,25 @@ export interface ProjectWorkerSummary {
    */
   activeRunningCount: number | null;
   /**
-   * Workers that are confirmed alive (fresh heartbeat) but have stalled progress.
+   * Workers that are confirmed alive (fresh heartbeat + fresh source observation) but have stalled progress.
    */
   stalledProgressCount: number;
   /**
-   * Workers whose current execution state cannot be confirmed (expired heartbeat without authoritative stop proof,
+   * Workers whose current execution state cannot be confirmed (expired heartbeat, stale worker.source.observedAt,
    * invalid/future timestamp, or coverageAvailable=false).
    */
   unknownExecutionCount: number;
   /**
-   * Alias preserved for tests checking expired heartbeats specifically.
+   * Alias preserved for tests checking expired heartbeats or stale worker source observations.
    */
   staleHeartbeatCount: number;
+  /**
+   * Count of covered workers on this project whose `worker.source.observedAt` is stale or invalid.
+   * Tracked explicitly so one fresh worker never masks a stale other worker.
+   */
+  staleSourceObservationCount: number;
+  oldestWorkerSourceAgeSeconds: number | null;
+  newestWorkerSourceAgeSeconds: number | null;
   crashedOrFailedCount: number;
   idleOrQueuedCount: number;
   disconnectedCount: number;
@@ -95,6 +106,7 @@ export interface EvaluatedProject {
   pendingRequiredGateCount: number;
   skippedRequiredGateCount: number;
   lastVerifiedUpdateAt: string | null;
+  projectMetadataAgeSeconds: number | null;
   executionFinishedButAcceptanceFailed: boolean;
   inconsistentCompletionClaim: boolean;
   completionContradictionReason: string | null;
@@ -291,11 +303,36 @@ export function deduplicateSnapshot(raw: MissionControlSnapshot): DeduplicationR
 }
 
 /**
+ * Returns true when a worker record represents a proven stopped or terminal execution state
+ * (`rawStatus === 'stopped'`, `rawStatus === 'crashed'`, `rawStatus === 'failed'`, or
+ * `Boolean(worker.authoritativeStopProof)`).
+ * Proven stopped/terminal records retain their historical observation age diagnostics
+ * (`sourceObservationAgeSeconds`, `oldestWorkerSourceAgeSeconds`) without creating current
+ * execution uncertainty (`staleSourceObservation`, `staleSourceObservationCount`).
+ */
+export function isProvenStoppedOrTerminalWorker(
+  worker: Pick<WorkerRecord, 'rawStatus' | 'authoritativeStopProof'>
+): boolean {
+  return (
+    worker.rawStatus === 'stopped' ||
+    worker.rawStatus === 'crashed' ||
+    worker.rawStatus === 'failed' ||
+    Boolean(worker.authoritativeStopProof && worker.authoritativeStopProof.trim().length > 0)
+  );
+}
+
+/**
  * Evaluates a single worker record against `nowIso` and thresholds.
  * Enforces:
  * - Invalid or implausibly future timestamps are treated as UNCERTAIN, never fresh.
- * - Expired heartbeat without authoritative stop proof makes execution UNKNOWN (`unknown_expired_heartbeat`).
- * - Fresh heartbeat with stale/missing progress is alive/running with stalled progress (`stalled_progress`).
+ * - Expired heartbeat OR stale `worker.source.observedAt` (> heartbeatExpirySeconds) without
+ *   authoritative stop proof makes execution UNKNOWN (`unknown_expired_heartbeat`).
+ *   A fresh snapshot envelope with a fresh heartbeat timestamp but an OLD `worker.source.observedAt`
+ *   must NEVER confirm that worker alive.
+ * - Proven stopped/terminal workers retain historical `sourceObservationAgeSeconds` diagnostics
+ *   without being counted as uncertain/stale live execution sources.
+ * - Fresh heartbeat + fresh `worker.source.observedAt` with stale/missing progress is alive/running
+ *   with stalled progress (`stalled_progress`).
  */
 export function evaluateWorker(
   worker: WorkerRecord,
@@ -304,9 +341,19 @@ export function evaluateWorker(
 ): EvaluatedWorker {
   const hbEval = evaluateTimestamp(worker.lastHeartbeatAt, nowIso);
   const progEval = evaluateTimestamp(worker.lastMeaningfulProgressAt, nowIso);
+  const sourceEval = evaluateTimestamp(worker.source?.observedAt, nowIso);
 
   const heartbeatAgeSeconds = hbEval.valid ? hbEval.ageSeconds : null;
   const progressAgeSeconds = progEval.valid ? progEval.ageSeconds : null;
+  const sourceObservationAgeSeconds = sourceEval.valid ? sourceEval.ageSeconds : null;
+  const isSourceObservationFresh =
+    sourceEval.valid &&
+    sourceObservationAgeSeconds !== null &&
+    sourceObservationAgeSeconds <= thresholds.heartbeatExpirySeconds;
+  const isTerminalOrStopped = isProvenStoppedOrTerminalWorker(worker);
+  const staleSourceObservation = Boolean(
+    worker.coverageAvailable && !isTerminalOrStopped && !isSourceObservationFresh
+  );
 
   const warnings: string[] = [];
   if (worker.lastHeartbeatAt && !hbEval.valid) {
@@ -314,6 +361,9 @@ export function evaluateWorker(
   }
   if (worker.lastMeaningfulProgressAt && !progEval.valid) {
     warnings.push(`Progress timestamp uncertain: ${progEval.reason}`);
+  }
+  if (!sourceEval.valid) {
+    warnings.push(`Source observation timestamp uncertain: ${sourceEval.reason}`);
   }
   const timestampWarning = warnings.length > 0 ? warnings.join(' · ') : undefined;
 
@@ -326,6 +376,9 @@ export function evaluateWorker(
       isExecutionUnknown: true,
       heartbeatAgeSeconds,
       progressAgeSeconds,
+      sourceObservationAgeSeconds,
+      isSourceObservationFresh: false,
+      staleSourceObservation: false,
       timestampWarning,
       statusExplanation: 'Worker execution telemetry coverage is unavailable.',
     };
@@ -340,6 +393,9 @@ export function evaluateWorker(
       isExecutionUnknown: true,
       heartbeatAgeSeconds,
       progressAgeSeconds,
+      sourceObservationAgeSeconds,
+      isSourceObservationFresh,
+      staleSourceObservation,
       timestampWarning,
       statusExplanation:
         'Worker daemon disconnected from local supervisor; current state unconfirmed.',
@@ -355,6 +411,9 @@ export function evaluateWorker(
       isExecutionUnknown: false,
       heartbeatAgeSeconds,
       progressAgeSeconds,
+      sourceObservationAgeSeconds,
+      isSourceObservationFresh,
+      staleSourceObservation,
       timestampWarning,
       statusExplanation: worker.exitReason
         ? `Confirmed crash: ${worker.exitReason}`
@@ -371,6 +430,9 @@ export function evaluateWorker(
       isExecutionUnknown: false,
       heartbeatAgeSeconds,
       progressAgeSeconds,
+      sourceObservationAgeSeconds,
+      isSourceObservationFresh,
+      staleSourceObservation,
       timestampWarning,
       statusExplanation: worker.exitReason
         ? `Confirmed run failure: ${worker.exitReason}`
@@ -387,6 +449,9 @@ export function evaluateWorker(
       isExecutionUnknown: false,
       heartbeatAgeSeconds,
       progressAgeSeconds,
+      sourceObservationAgeSeconds,
+      isSourceObservationFresh,
+      staleSourceObservation,
       timestampWarning,
       statusExplanation: worker.authoritativeStopProof
         ? `Stopped cleanly (${worker.authoritativeStopProof}).`
@@ -403,22 +468,39 @@ export function evaluateWorker(
       isExecutionUnknown: false,
       heartbeatAgeSeconds,
       progressAgeSeconds,
+      sourceObservationAgeSeconds,
+      isSourceObservationFresh,
+      staleSourceObservation,
       timestampWarning,
       statusExplanation: 'Queued in dispatcher; no worker process is executing yet.',
     };
   }
 
   if (worker.rawStatus === 'idle') {
+    const isIdleAlive =
+      hbEval.valid &&
+      heartbeatAgeSeconds !== null &&
+      heartbeatAgeSeconds <= thresholds.heartbeatExpirySeconds &&
+      isSourceObservationFresh;
     return {
       ...worker,
       evaluatedState: 'idle',
-      isConfirmedAlive: false,
+      isConfirmedAlive: isIdleAlive && false, // Idle workers are not counted in confirmedRunningCount
       isMakingProgress: false,
-      isExecutionUnknown: false,
+      isExecutionUnknown: !isSourceObservationFresh,
       heartbeatAgeSeconds,
       progressAgeSeconds,
+      sourceObservationAgeSeconds,
+      isSourceObservationFresh,
+      staleSourceObservation,
       timestampWarning,
-      statusExplanation: 'Session idle; waiting for task assignment.',
+      statusExplanation: isSourceObservationFresh
+        ? 'Session idle; waiting for task assignment.'
+        : `Session reported idle, but worker source observation is stale (${
+            sourceObservationAgeSeconds !== null
+              ? `${sourceObservationAgeSeconds}s ago`
+              : 'invalid'
+          }).`,
     };
   }
 
@@ -433,12 +515,15 @@ export function evaluateWorker(
       isExecutionUnknown: false,
       heartbeatAgeSeconds,
       progressAgeSeconds,
+      sourceObservationAgeSeconds,
+      isSourceObservationFresh,
+      staleSourceObservation,
       timestampWarning,
       statusExplanation: `Authoritative stop recorded: ${worker.authoritativeStopProof}`,
     };
   }
 
-  // If heartbeat timestamp is missing, invalid, future-skewed, or expired -> execution is UNKNOWN
+  // 1) If heartbeat timestamp is missing, invalid, future-skewed, or expired -> execution is UNKNOWN
   if (
     !hbEval.valid ||
     heartbeatAgeSeconds === null ||
@@ -456,12 +541,38 @@ export function evaluateWorker(
       isExecutionUnknown: true,
       heartbeatAgeSeconds,
       progressAgeSeconds,
+      sourceObservationAgeSeconds,
+      isSourceObservationFresh,
+      staleSourceObservation,
       timestampWarning,
       statusExplanation: reason,
     };
   }
 
-  // Worker has a fresh valid heartbeat -> It IS confirmed alive/running!
+  // 2) Separate snapshot envelope age and heartbeat claim from worker source observation age (`worker.source.observedAt`):
+  // A fresh envelope with a fresh heartbeat but an OLD or invalid `worker.source.observedAt` MUST NOT confirm that worker alive!
+  if (!isSourceObservationFresh) {
+    const reason = !sourceEval.valid
+      ? `Worker source.observedAt timestamp invalid/future (${sourceEval.reason}). Current execution is unknown despite reported heartbeat (${heartbeatAgeSeconds}s ago).`
+      : `Worker source observation stale (source.observedAt ${sourceObservationAgeSeconds}s ago > ${thresholds.heartbeatExpirySeconds}s limit, despite reported heartbeat ${heartbeatAgeSeconds}s ago). Current execution is unknown.`;
+
+    return {
+      ...worker,
+      evaluatedState: 'unknown_expired_heartbeat',
+      isConfirmedAlive: false,
+      isMakingProgress: false,
+      isExecutionUnknown: true,
+      heartbeatAgeSeconds,
+      progressAgeSeconds,
+      sourceObservationAgeSeconds,
+      isSourceObservationFresh: false,
+      staleSourceObservation: true,
+      timestampWarning,
+      statusExplanation: reason,
+    };
+  }
+
+  // Worker has BOTH a fresh valid heartbeat AND a fresh valid source observation -> It IS confirmed alive/running!
   // Now check whether meaningful progress is also fresh and valid.
   if (
     !progEval.valid ||
@@ -483,8 +594,11 @@ export function evaluateWorker(
       isExecutionUnknown: false,
       heartbeatAgeSeconds,
       progressAgeSeconds,
+      sourceObservationAgeSeconds,
+      isSourceObservationFresh: true,
+      staleSourceObservation: false,
       timestampWarning,
-      statusExplanation: `Alive & running (heartbeat ${heartbeatAgeSeconds}s ago), but stalled with ${progDetail}.`,
+      statusExplanation: `Alive & running (heartbeat ${heartbeatAgeSeconds}s ago, source observed ${sourceObservationAgeSeconds}s ago), but stalled with ${progDetail}.`,
     };
   }
 
@@ -496,8 +610,11 @@ export function evaluateWorker(
     isExecutionUnknown: false,
     heartbeatAgeSeconds,
     progressAgeSeconds,
+    sourceObservationAgeSeconds,
+    isSourceObservationFresh: true,
+    staleSourceObservation: false,
     timestampWarning,
-    statusExplanation: `Confirmed running with fresh heartbeat (${heartbeatAgeSeconds}s ago) and verified progress (${progressAgeSeconds}s ago).`,
+    statusExplanation: `Confirmed running with fresh heartbeat (${heartbeatAgeSeconds}s ago), fresh source observation (${sourceObservationAgeSeconds}s ago), and verified progress (${progressAgeSeconds}s ago).`,
   };
 }
 
@@ -526,6 +643,21 @@ export function evaluateProject(
   ).length;
   const unknownExecutionCount = projectWorkers.filter((w) => w.isExecutionUnknown).length;
 
+  // Count only non-terminal covered workers with stale source observations toward current execution uncertainty;
+  // proven stopped/terminal workers retain historical age diagnostics (`oldestWorkerSourceAgeSeconds`) without excluding
+  // a project with a fresh running worker from `working_now`.
+  const staleSourceObservationCount = projectWorkers.filter(
+    (w) => w.staleSourceObservation
+  ).length;
+
+  const validSourceAges = projectWorkers
+    .map((w) => w.sourceObservationAgeSeconds)
+    .filter((age): age is number => typeof age === 'number');
+  const oldestWorkerSourceAgeSeconds =
+    validSourceAges.length > 0 ? Math.max(...validSourceAges) : null;
+  const newestWorkerSourceAgeSeconds =
+    validSourceAges.length > 0 ? Math.min(...validSourceAges) : null;
+
   const crashedOrFailedCount = projectWorkers.filter(
     (w) => w.evaluatedState === 'crashed' || w.evaluatedState === 'failed'
   ).length;
@@ -540,7 +672,9 @@ export function evaluateProject(
   ).length;
 
   const hasUncertainWorkerCount =
-    !project.workerCoverageKnown || unknownExecutionCount > 0;
+    !project.workerCoverageKnown ||
+    unknownExecutionCount > 0 ||
+    staleSourceObservationCount > 0;
 
   // Never represent an uncertain total as zero when coverage is unknown
   const confirmedRunningCount =
@@ -559,6 +693,9 @@ export function evaluateProject(
     stalledProgressCount,
     unknownExecutionCount,
     staleHeartbeatCount,
+    staleSourceObservationCount,
+    oldestWorkerSourceAgeSeconds,
+    newestWorkerSourceAgeSeconds,
     crashedOrFailedCount,
     idleOrQueuedCount,
     disconnectedCount,
@@ -784,14 +921,25 @@ export function evaluateProject(
     ? `Claimed verified_passed, but cannot verify completion: ${strictCompletionReasons.join(' ')}`
     : null;
 
-  // Missing telemetry alone is NOT proof a project is stalled or blocked!
-  const telemetryUncertain = !project.workerCoverageKnown || unknownExecutionCount > 0;
+  // Missing telemetry or stale worker source observation alone is NOT proof a project is stalled or blocked!
+  const telemetryUncertain =
+    !project.workerCoverageKnown ||
+    unknownExecutionCount > 0 ||
+    staleSourceObservationCount > 0;
+
+  // Static project metadata observation age (tracked for diagnostics; old static metadata never marks a project blocked or connection failed)
+  const projSourceEval = evaluateTimestamp(project.source?.observedAt, nowIso);
+  const projectMetadataAgeSeconds = projSourceEval.valid ? projSourceEval.ageSeconds : null;
 
   // Determine Overview Buckets
   const buckets: ProjectOverviewBucket[] = [];
 
-  // A project is Working Now if it has at least 1 confirmed alive/running worker (either actively progressing or alive-with-stalled-progress)
-  if (confirmedRunningCount !== null && confirmedRunningCount > 0) {
+  // A project is Working Now if it has at least 1 confirmed alive/running worker AND no other covered worker on the project has a stale source observation (so one fresh worker never masks a stale worker).
+  if (
+    confirmedRunningCount !== null &&
+    confirmedRunningCount > 0 &&
+    staleSourceObservationCount === 0
+  ) {
     buckets.push('working_now');
   }
 
@@ -871,6 +1019,16 @@ export function evaluateProject(
   } else if (stalledProgressCount > 0) {
     primaryStatusLabel = 'Running (Alive) · Progress Stalled';
     primaryStatusTone = 'warning';
+  } else if (
+    projectWorkers.some(
+      (w) =>
+        w.staleSourceObservation &&
+        w.heartbeatAgeSeconds !== null &&
+        w.heartbeatAgeSeconds <= snapshot.evaluationThresholds.heartbeatExpirySeconds
+    )
+  ) {
+    primaryStatusLabel = 'Execution Unknown · Stale Worker Source';
+    primaryStatusTone = 'warning';
   } else if (staleHeartbeatCount > 0) {
     primaryStatusLabel = 'Execution Unknown · Heartbeat Expired';
     primaryStatusTone = 'warning';
@@ -911,6 +1069,7 @@ export function evaluateProject(
     pendingRequiredGateCount,
     skippedRequiredGateCount,
     lastVerifiedUpdateAt,
+    projectMetadataAgeSeconds,
     executionFinishedButAcceptanceFailed,
     inconsistentCompletionClaim,
     completionContradictionReason,

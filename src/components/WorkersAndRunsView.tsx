@@ -33,11 +33,14 @@ export const WorkersAndRunsView: React.FC<WorkersAndRunsViewProps> = ({
               Worker Execution, Liveness & Progress Telemetry ({evaluatedWorkers.length} registered)
             </h2>
             <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">
-              A worker with a fresh heartbeat (&le;
-              {snapshot.evaluationThresholds.heartbeatExpirySeconds}s) is confirmed alive, even if
-              progress is stalled (&gt;
-              {Math.floor(snapshot.evaluationThresholds.stalledProgressSeconds / 60)}m). An expired
-              heartbeat without authoritative stop proof makes execution state UNKNOWN.
+              Confirming a worker alive requires both a fresh heartbeat (&le;
+              {snapshot.evaluationThresholds.heartbeatExpirySeconds}s) and a fresh worker source
+              observation (<code className="font-mono">worker.source.observedAt</code> &le;
+              {snapshot.evaluationThresholds.heartbeatExpirySeconds}s). Progress is tracked
+              separately (&gt;
+              {Math.floor(snapshot.evaluationThresholds.stalledProgressSeconds / 60)}m = stalled).
+              An expired heartbeat or stale worker source observation without authoritative stop
+              proof makes execution state UNKNOWN.
             </p>
           </div>
         </div>
@@ -50,6 +53,7 @@ export const WorkersAndRunsView: React.FC<WorkersAndRunsViewProps> = ({
                 <th className="py-2.5 px-3 font-medium">Project</th>
                 <th className="py-2.5 px-3 font-medium">Evaluated State</th>
                 <th className="py-2.5 px-3 font-medium text-right">Heartbeat Age</th>
+                <th className="py-2.5 px-3 font-medium text-right">Source Observed Age</th>
                 <th className="py-2.5 px-3 font-medium text-right">Meaningful Progress Age</th>
                 <th className="py-2.5 px-3 font-medium">Diagnostic / Latest Output</th>
               </tr>
@@ -105,6 +109,28 @@ export const WorkersAndRunsView: React.FC<WorkersAndRunsViewProps> = ({
                     <td className="py-3 px-3 font-mono text-right tabular-nums text-slate-700 dark:text-slate-300">
                       {formatRelativeAge(w.lastHeartbeatAt, referenceNowIso)}
                     </td>
+                    <td className="py-3 px-3 font-mono text-right tabular-nums">
+                      <span
+                        className={
+                          w.staleSourceObservation
+                            ? 'font-semibold text-amber-800 dark:text-amber-400'
+                            : 'text-slate-700 dark:text-slate-300'
+                        }
+                      >
+                        {formatRelativeAge(w.source?.observedAt ?? null, referenceNowIso)}
+                      </span>
+                      <div className="text-[10px] text-slate-500 dark:text-slate-400">
+                        {w.staleSourceObservation
+                          ? 'STALE SOURCE'
+                          : w.isSourceObservationFresh
+                          ? 'fresh source'
+                          : w.evaluatedState === 'stopped' ||
+                            w.evaluatedState === 'crashed' ||
+                            w.evaluatedState === 'failed'
+                          ? 'historical (terminal)'
+                          : 'unverified'}
+                      </div>
+                    </td>
                     <td className="py-3 px-3 font-mono text-right tabular-nums text-slate-700 dark:text-slate-300">
                       {formatRelativeAge(w.lastMeaningfulProgressAt, referenceNowIso)}
                     </td>
@@ -136,15 +162,15 @@ export const WorkersAndRunsView: React.FC<WorkersAndRunsViewProps> = ({
           than fabricating 0 active workers. Missing telemetry alone never marks a project
           stalled.
         </p>
-        <div className="divide-y divide-slate-200 dark:divide-slate-800">
+        <div className="divide-y divide-slate-200 dark:divide-slate-800 min-w-0">
           {snapshot.projects
             .filter((p) => !p.workerCoverageKnown)
             .map((p) => (
               <div
                 key={p.projectId}
-                className="py-2.5 first:pt-0 last:pb-0 flex items-center justify-between gap-4 text-xs"
+                className="py-2.5 first:pt-0 last:pb-0 flex flex-wrap items-center justify-between gap-3 text-xs min-w-0"
               >
-                <div>
+                <div className="min-w-0 break-words [overflow-wrap:anywhere]">
                   <span className="font-semibold text-slate-900 dark:text-slate-100">
                     {p.name}
                   </span>
@@ -162,7 +188,7 @@ export const WorkersAndRunsView: React.FC<WorkersAndRunsViewProps> = ({
                 <button
                   type="button"
                   onClick={() => onSelectProject(p.projectId)}
-                  className="font-medium text-sky-700 dark:text-sky-400 hover:underline cursor-pointer"
+                  className="min-h-[34px] px-2.5 py-1.5 font-medium text-sky-700 dark:text-sky-400 hover:underline cursor-pointer shrink-0"
                 >
                   Open Side Panel
                 </button>

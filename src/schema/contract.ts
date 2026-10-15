@@ -402,12 +402,20 @@ export type CommandErrorCode =
   | 'NOT_CONNECTED'
   | 'VALIDATION_ERROR';
 
+export interface CanonicalIdentityMapping {
+  requestedRecipient: string;
+  canonicalRecipient: string;
+  verified: boolean;
+}
+
 /**
  * Command Contract Response
  * Strictly distinguishes:
  * - `commandAccepted`: Backend validated and persisted the request
  * - `deliveryAck.outcome`: Whether a downstream notification/action was actually delivered,
  *   merely queued (`accepted_pending_delivery`), failed (`failed_delivery`), or timed out (`uncertain_timeout`).
+ * - `deliveryAck.recipient`: Must match the requested `targetOwner` or include an explicit, verified
+ *   canonical identity mapping (`canonicalIdentityMapping` with `verified: true` or `requestedRecipient` + `canonicalMappingVerified: true`).
  */
 export interface OperatorCommandResponse {
   ok: boolean;
@@ -424,8 +432,12 @@ export interface OperatorCommandResponse {
     ackId: string | null;
     channel: string;
     recipient: string;
+    requestedRecipient?: string;
+    canonicalMappingVerified?: boolean;
+    canonicalIdentityMapping?: CanonicalIdentityMapping;
     error?: string;
   };
   errorCode?: CommandErrorCode;
   errorMessage?: string;
 }
+

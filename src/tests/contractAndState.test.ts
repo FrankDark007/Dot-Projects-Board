@@ -392,7 +392,149 @@ export function runAllContractAndStateTests(): {
         'Worker with implausibly future heartbeat must NOT be treated as fresh/alive'
       );
 
-      return 'Verified advancing clock expires heartbeats into unknownExecutionCount without a new snapshot, and future/invalid timestamps are never treated as fresh.';
+      // Fresh envelope + fresh heartbeat (14s old) + fresh progress (120s old),
+      // BUT OLD worker.source.observedAt (240s old > 90s heartbeatExpirySeconds):
+      // Must NOT confirm the worker alive!
+      const staleSourceIso = new Date(
+        Date.parse(REFERENCE_NOW_ISO) - 240 * 1000
+      ).toISOString();
+      const freshHbStaleSourceWorker: WorkerRecord = {
+        ...snap.workers.find((w) => w.workerId === 'wk-comp-01')!,
+        workerId: 'wk-fresh-hb-stale-source',
+        source: {
+          ...snap.workers[0].source,
+          observedAt: staleSourceIso,
+        },
+      };
+      const evalStaleSourceW = evaluateWorker(
+        freshHbStaleSourceWorker,
+        REFERENCE_NOW_ISO,
+        snap.evaluationThresholds
+      );
+      assert(
+        evalStaleSourceW.isConfirmedAlive === false &&
+          evalStaleSourceW.isMakingProgress === false &&
+          evalStaleSourceW.isExecutionUnknown === true &&
+          evalStaleSourceW.staleSourceObservation === true &&
+          evalStaleSourceW.isSourceObservationFresh === false &&
+          evalStaleSourceW.evaluatedState === 'unknown_expired_heartbeat',
+        'Fresh envelope + fresh heartbeat with OLD worker.source.observedAt (240s > 90s) must NOT confirm worker alive'
+      );
+
+      // Even an idle worker with a fresh heartbeat but OLD worker.source.observedAt must not be confirmed alive:
+      const idleStaleSourceWorker: WorkerRecord = {
+        ...snap.workers.find((w) => w.rawStatus === 'idle')!,
+        lastHeartbeatAt: new Date(
+          Date.parse(REFERENCE_NOW_ISO) - 10 * 1000
+        ).toISOString(),
+        source: {
+          ...snap.workers[0].source,
+          observedAt: staleSourceIso,
+        },
+      };
+      const evalIdleStaleSourceW = evaluateWorker(
+        idleStaleSourceWorker,
+        REFERENCE_NOW_ISO,
+        snap.evaluationThresholds
+      );
+      assert(
+        evalIdleStaleSourceW.isConfirmedAlive === false &&
+          evalIdleStaleSourceW.staleSourceObservation === true,
+        'Idle worker with fresh heartbeat but old worker.source.observedAt must not be confirmed alive'
+      );
+
+      // One fresh worker (wk-comp-01) must NOT mask a stale other worker (wk-comp-02 with stale source.observedAt):
+      const snapMixedWorkers: MissionControlSnapshot = {
+        ...snap,
+        workers: snap.workers.map((w) =>
+          w.workerId === 'wk-comp-02'
+            ? {
+                ...w,
+                // Keep lastHeartbeatAt fresh (22s old) while making source.observedAt stale (240s old)
+                source: {
+                  ...w.source,
+                  observedAt: staleSourceIso,
+                },
+              }
+            : w
+        ),
+      };
+      const evalMixedProject = evaluateProject(
+        compactor,
+        snapMixedWorkers,
+        REFERENCE_NOW_ISO
+      );
+      assert(
+        evalMixedProject.workerSummary.confirmedRunningCount === 1 &&
+          evalMixedProject.workerSummary.unknownExecutionCount === 1 &&
+          evalMixedProject.workerSummary.staleSourceObservationCount === 1,
+        'Project with 1 fresh worker and 1 stale-source worker reports 1 confirmedRunning, 1 unknownExecution, and 1 staleSourceObservation'
+      );
+      assert(
+        evalMixedProject.telemetryUncertain === true &&
+          !evalMixedProject.buckets.includes('working_now') &&
+          evalMixedProject.buckets.includes('unfinished') &&
+          evalMixedProject.primaryStatusLabel.includes('Stale Worker Source'),
+        'One fresh worker must NOT mask a stale other worker into working_now or hide Stale Worker Source status'
+      );
+
+      // Regression: A project with a fresh running worker (`wk-comp-01`) PLUS an old proven stopped worker
+      // (both `rawStatus: 'stopped'` and `rawStatus: 'running'` with `authoritativeStopProof` whose `source.observedAt`
+      // is 20 minutes old) must NOT count the stopped worker toward current execution uncertainty (`staleSourceObservationCount === 0`),
+      // MUST retain historical observation age diagnostics (`oldestWorkerSourceAgeSeconds === 1200`),
+      // and MUST include the project in `working_now`!
+      const twentyMinutesAgoIso = new Date(
+        Date.parse(REFERENCE_NOW_ISO) - 1200 * 1000
+      ).toISOString();
+      const snapFreshRunningPlusOldStoppedProof: MissionControlSnapshot = {
+        ...snap,
+        workers: snap.workers.map((w) =>
+          w.workerId === 'wk-comp-02'
+            ? {
+                ...w,
+                rawStatus: 'running',
+                authoritativeStopProof: 'SIGTERM clean exit code 0 (shard #2 complete)',
+                lastHeartbeatAt: twentyMinutesAgoIso,
+                lastMeaningfulProgressAt: twentyMinutesAgoIso,
+                source: {
+                  ...w.source,
+                  observedAt: twentyMinutesAgoIso,
+                },
+              }
+            : w
+        ),
+      };
+      const evalStoppedSiblingW = evaluateWorker(
+        snapFreshRunningPlusOldStoppedProof.workers.find((w) => w.workerId === 'wk-comp-02')!,
+        REFERENCE_NOW_ISO,
+        snap.evaluationThresholds
+      );
+      assert(
+        evalStoppedSiblingW.evaluatedState === 'stopped' &&
+          evalStoppedSiblingW.isExecutionUnknown === false &&
+          evalStoppedSiblingW.staleSourceObservation === false &&
+          evalStoppedSiblingW.sourceObservationAgeSeconds === 1200,
+        'Old worker with authoritativeStopProof evaluates to stopped with staleSourceObservation=false while retaining 1200s historical age'
+      );
+
+      const evalProjectWithOldStoppedProof = evaluateProject(
+        compactor,
+        snapFreshRunningPlusOldStoppedProof,
+        REFERENCE_NOW_ISO
+      );
+      assert(
+        evalProjectWithOldStoppedProof.workerSummary.confirmedRunningCount === 1 &&
+          evalProjectWithOldStoppedProof.workerSummary.unknownExecutionCount === 0 &&
+          evalProjectWithOldStoppedProof.workerSummary.staleSourceObservationCount === 0 &&
+          evalProjectWithOldStoppedProof.workerSummary.hasUncertainWorkerCount === false &&
+          evalProjectWithOldStoppedProof.telemetryUncertain === false &&
+          evalProjectWithOldStoppedProof.workerSummary.oldestWorkerSourceAgeSeconds === 1200 &&
+          evalProjectWithOldStoppedProof.buckets.includes('working_now') &&
+          evalProjectWithOldStoppedProof.primaryStatusLabel === 'Running · Verified Progress',
+        'Project with 1 fresh running worker + 1 old proven stopped worker stays in working_now with 0 staleSourceObservationCount while retaining 1200s oldestWorkerSourceAgeSeconds'
+      );
+
+      return 'Verified heartbeat expiry, future/invalid timestamp rejection, fresh-heartbeat + old worker.source.observedAt rejection, non-masking of stale running siblings, and working_now inclusion with old stopped proof.';
     }
   );
 
@@ -1125,7 +1267,165 @@ export function runAllContractAndStateTests(): {
         'delivered_acknowledged with acknowledged:false / ackId:null rejected'
       );
 
-      // 5. Separate transport health from snapshot data freshness:
+      // 5. Negative Regression: Reminder requested for "Alice" must REJECT acknowledgment naming "Bob"
+      const aliceReminderReq: OperatorCommandRequest = {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        idempotencyKey: 'req-alice-rem-1',
+        expectedRevision: 12,
+        issuedAt: REFERENCE_NOW_ISO,
+        command: {
+          type: 'send_reminder',
+          projectId: 'prj-context-compactor',
+          targetOwner: 'Alice',
+          message: 'Status check for Alice',
+        },
+      };
+      const bobAckForAliceRes = validateCommandResponsePayload(
+        {
+          ok: true,
+          idempotencyKey: 'req-alice-rem-1',
+          commandAccepted: true,
+          deliveryAck: {
+            acknowledged: true,
+            outcome: 'delivered_acknowledged',
+            ackId: 'ack-bob-99',
+            channel: 'ipc',
+            recipient: 'Bob',
+          },
+        },
+        aliceReminderReq,
+        200,
+        true
+      );
+      assert(
+        bobAckForAliceRes.ok === false &&
+          bobAckForAliceRes.commandAccepted === false &&
+          bobAckForAliceRes.errorCode === 'VALIDATION_ERROR' &&
+          Boolean(bobAckForAliceRes.errorMessage?.includes('recipient mismatch')),
+        'Reminder requested for Alice rejects acknowledgment naming Bob with VALIDATION_ERROR'
+      );
+
+      // 6. Negative Regression: Unverified canonical identity mapping (verified: false) for Alice -> alice@corp.local is REJECTED
+      const unverifiedCanonicalRes = validateCommandResponsePayload(
+        {
+          ok: true,
+          idempotencyKey: 'req-alice-rem-1',
+          commandAccepted: true,
+          deliveryAck: {
+            acknowledged: true,
+            outcome: 'delivered_acknowledged',
+            ackId: 'ack-alice-canon-1',
+            channel: 'ipc',
+            recipient: 'alice@corp.local',
+            canonicalIdentityMapping: {
+              requestedRecipient: 'Alice',
+              canonicalRecipient: 'alice@corp.local',
+              verified: false,
+            },
+          },
+        },
+        aliceReminderReq,
+        200,
+        true
+      );
+      assert(
+        unverifiedCanonicalRes.ok === false &&
+          unverifiedCanonicalRes.errorCode === 'VALIDATION_ERROR',
+        'Reminder with unverified canonicalIdentityMapping (verified: false) is rejected'
+      );
+
+      // 7. Positive Verification: Explicit verified canonical identity mapping (verified: true) for Alice -> alice@corp.local SUCCEEDS
+      const verifiedCanonicalRes = validateCommandResponsePayload(
+        {
+          ok: true,
+          idempotencyKey: 'req-alice-rem-1',
+          commandAccepted: true,
+          deliveryAck: {
+            acknowledged: true,
+            outcome: 'delivered_acknowledged',
+            ackId: 'ack-alice-canon-2',
+            channel: 'ipc',
+            recipient: 'alice@corp.local',
+            canonicalIdentityMapping: {
+              requestedRecipient: 'Alice',
+              canonicalRecipient: 'alice@corp.local',
+              verified: true,
+            },
+          },
+        },
+        aliceReminderReq,
+        200,
+        true
+      );
+      assert(
+        verifiedCanonicalRes.ok === true &&
+          verifiedCanonicalRes.commandAccepted === true &&
+          verifiedCanonicalRes.deliveryAck?.recipient === 'alice@corp.local',
+        'Reminder with explicit verified canonicalIdentityMapping succeeds'
+      );
+
+      // 8. Negative Regression: Response with ok:true and commandAccepted:false must NEVER become success
+      const okTrueAcceptedFalseRes = validateCommandResponsePayload(
+        {
+          ok: true,
+          idempotencyKey: 'req-key-101',
+          commandAccepted: false,
+          deliveryAck: {
+            acknowledged: true,
+            outcome: 'delivered_acknowledged',
+            ackId: 'ack-1',
+            channel: 'ipc',
+            recipient: 'dot',
+          },
+        },
+        sampleReq,
+        200,
+        true
+      );
+      assert(
+        okTrueAcceptedFalseRes.ok === false &&
+          okTrueAcceptedFalseRes.commandAccepted === false &&
+          okTrueAcceptedFalseRes.errorCode === 'VALIDATION_ERROR' &&
+          Boolean(
+            okTrueAcceptedFalseRes.errorMessage?.includes(
+              'ok:true cannot be paired with commandAccepted:false'
+            )
+          ),
+        'Contradictory response with ok:true and commandAccepted:false is rejected with VALIDATION_ERROR'
+      );
+
+      // 9. Negative Regression: Response with ok:true and errorCode: DELIVERY_FAILED must NEVER become success
+      const okTrueDeliveryFailedCodeRes = validateCommandResponsePayload(
+        {
+          ok: true,
+          idempotencyKey: 'req-key-101',
+          commandAccepted: true,
+          errorCode: 'DELIVERY_FAILED',
+          deliveryAck: {
+            acknowledged: true,
+            outcome: 'delivered_acknowledged',
+            ackId: 'ack-1',
+            channel: 'ipc',
+            recipient: 'dot',
+          },
+        },
+        sampleReq,
+        200,
+        true
+      );
+      assert(
+        okTrueDeliveryFailedCodeRes.ok === false &&
+          okTrueDeliveryFailedCodeRes.commandAccepted === false &&
+          okTrueDeliveryFailedCodeRes.errorCode === 'VALIDATION_ERROR' &&
+          Boolean(
+            okTrueDeliveryFailedCodeRes.errorMessage?.includes(
+              'ok:true cannot include error fields'
+            )
+          ),
+        'Contradictory response with ok:true and errorCode:DELIVERY_FAILED is rejected with VALIDATION_ERROR'
+      );
+
+      // 10. Separate transport health from snapshot data freshness:
       // Snapshot generatedAt is 120s old while staleFeedWarningSeconds is 30s
       const snap = createSyntheticSnapshot(REFERENCE_NOW_ISO);
       const nowPlus120s = new Date(
@@ -1143,7 +1443,7 @@ export function runAllContractAndStateTests(): {
         'Snapshot generated 120s ago (> 30s threshold) is marked stale even when HTTP transport succeeds'
       );
 
-      return 'Verified command validator rejects HTTP 500 ok:true, mismatched keys, and contradictory deliveryAck, and data freshness is separated from HTTP contact.';
+      return 'Verified command validator rejects Alice->Bob recipient mismatch, ok:true+commandAccepted:false, ok:true+errorCode:DELIVERY_FAILED, HTTP 500 ok:true, and stale data on HTTP 200.';
     }
   );
 
@@ -1422,37 +1722,213 @@ export async function runAsyncTransportTests(): Promise<{
         'Repeated HTTP 200 response with old generatedAt updates lastSuccessfulContactAt but transitions connectionHealth to stale'
       );
 
-      // 3rd poll: out-of-order snapshot (sequence 12 < 42)
+      // 3rd poll at t=+110s: out-of-order snapshot (sequence 12 < 42) over HTTP 200
+      // Must advance lastSuccessfulContactAt to outOfOrderContactIso while preserving lastValidSnapshot!
+      const outOfOrderContactIso = new Date(
+        Date.parse(REFERENCE_NOW_ISO) + 110 * 1000
+      ).toISOString();
       const staleSnap = { ...validSnap, snapshotId: 'snap-old', sequence: 12 };
       const outOfOrderFetch: FetchLike = async () =>
         new Response(JSON.stringify(staleSnap), { status: 200 });
       const res2 = await coordinator.pollOnce(DEFAULT_LIVE_CONFIG, {
-        referenceNowIso: laterContactIso,
+        referenceNowIso: outOfOrderContactIso,
         fetchImpl: outOfOrderFetch,
       });
       assert(
         res2.status === 'rejected_validation_preserved_last' &&
           res2.connectionHealth === 'stale' &&
-          res2.snapshot?.snapshotId === validSnap.snapshotId,
-        'Out-of-order response is rejected while preserving last valid snapshot'
+          res2.lastSuccessfulContactAt === outOfOrderContactIso &&
+          res2.snapshot?.snapshotId === validSnap.snapshotId &&
+          res2.snapshotGeneratedAt === validSnap.generatedAt &&
+          Boolean(res2.warningOrError?.includes('Endpoint reachable')),
+        'HTTP 200 out-of-order response advances lastSuccessfulContactAt independently, reports reachable invalid-data warning, and preserves last valid snapshot'
       );
 
-      // 4th poll: malformed JSON structure
+      // 4th poll at t=+130s: HTTP 200 with malformed schema payload
+      // Must advance lastSuccessfulContactAt to malformedSchemaContactIso while preserving lastValidSnapshot!
+      const malformedSchemaContactIso = new Date(
+        Date.parse(REFERENCE_NOW_ISO) + 130 * 1000
+      ).toISOString();
       const malformedFetch: FetchLike = async () =>
         new Response(JSON.stringify({ schemaVersion: CONTRACT_SCHEMA_VERSION }), {
           status: 200,
         });
       const res3 = await coordinator.pollOnce(DEFAULT_LIVE_CONFIG, {
-        referenceNowIso: laterContactIso,
+        referenceNowIso: malformedSchemaContactIso,
         fetchImpl: malformedFetch,
       });
       assert(
         res3.status === 'rejected_validation_preserved_last' &&
-          res3.snapshot?.snapshotId === validSnap.snapshotId,
-        'Malformed response is rejected while preserving last valid snapshot'
+          res3.connectionHealth === 'stale' &&
+          res3.lastSuccessfulContactAt === malformedSchemaContactIso &&
+          res3.snapshot?.snapshotId === validSnap.snapshotId &&
+          res3.snapshotGeneratedAt === validSnap.generatedAt &&
+          Boolean(res3.warningOrError?.includes('Endpoint reachable')),
+        'HTTP 200 malformed schema response advances lastSuccessfulContactAt independently, reports reachable invalid-data warning, and preserves last valid snapshot'
       );
 
-      return 'Verified repeated HTTP 200 with old snapshot marks health stale while updating contact time, and malformed/out-of-order responses preserve last valid snapshot.';
+      // 5th poll at t=+150s: HTTP 200 with invalid/unparseable JSON body
+      // Must NOT become network_error/disconnected! Must classify as rejected_validation_preserved_last,
+      // advance lastSuccessfulContactAt to invalidJsonContactIso, keep connectionHealth='stale', and preserve lastValidSnapshot!
+      const invalidJsonContactIso = new Date(
+        Date.parse(REFERENCE_NOW_ISO) + 150 * 1000
+      ).toISOString();
+      const invalidJsonFetch: FetchLike = async () =>
+        new Response('{"corruptedJsonPayload": true, unquoted_syntax_error', {
+          status: 200,
+        });
+      const resInvalidJson = await coordinator.pollOnce(DEFAULT_LIVE_CONFIG, {
+        referenceNowIso: invalidJsonContactIso,
+        fetchImpl: invalidJsonFetch,
+      });
+      assert(
+        resInvalidJson.status === 'rejected_validation_preserved_last' &&
+          resInvalidJson.connectionHealth === 'stale' &&
+          resInvalidJson.lastSuccessfulContactAt === invalidJsonContactIso &&
+          resInvalidJson.snapshot?.snapshotId === validSnap.snapshotId &&
+          resInvalidJson.snapshotGeneratedAt === validSnap.generatedAt &&
+          Boolean(
+            resInvalidJson.warningOrError?.includes('Endpoint reachable') &&
+              resInvalidJson.warningOrError?.includes('INVALID_JSON')
+          ),
+        'HTTP 200 invalid JSON response is classified as rejected_validation_preserved_last (never network_error/disconnected), advances lastSuccessfulContactAt, and preserves last valid snapshot'
+      );
+
+      // 6th check: Old static project metadata (`project.source.observedAt` 30 days old) alone
+      // must NOT imply a failed or stale connection when transport contact & envelope are fresh!
+      const thirtyDaysAgoIso = new Date(
+        Date.parse(REFERENCE_NOW_ISO) - 30 * 86400 * 1000
+      ).toISOString();
+      const snapOldStaticProjectMeta: MissionControlSnapshot = {
+        ...validSnap,
+        snapshotId: 'snap-old-project-meta-fresh-envelope',
+        sequence: 50,
+        generatedAt: REFERENCE_NOW_ISO,
+        projects: validSnap.projects.map((p, idx) => ({
+          ...p,
+          source: {
+            ...p.source,
+            sequence: 500 + idx,
+            observedAt: thirtyDaysAgoIso,
+          },
+        })),
+      };
+      const freshnessOldProjectMeta = evaluateSnapshotDataFreshness(
+        snapOldStaticProjectMeta,
+        REFERENCE_NOW_ISO,
+        DEFAULT_LIVE_CONFIG
+      );
+      assert(
+        freshnessOldProjectMeta.isDataFresh === true &&
+          freshnessOldProjectMeta.areAllWorkerSourcesFresh === true &&
+          freshnessOldProjectMeta.oldestProjectMetadataAgeSeconds === 30 * 86400,
+        'Old static project metadata is tracked separately and does not mark snapshot or worker sources stale'
+      );
+      const coordOldProj = new LivePollCoordinator();
+      const resOldProjMeta = await coordOldProj.pollOnce(DEFAULT_LIVE_CONFIG, {
+        referenceNowIso: REFERENCE_NOW_ISO,
+        fetchImpl: async () =>
+          new Response(JSON.stringify(snapOldStaticProjectMeta), { status: 200 }),
+      });
+      assert(
+        resOldProjMeta.status === 'updated' &&
+          resOldProjMeta.connectionHealth === 'connected' &&
+          resOldProjMeta.warningOrError === null,
+        'Old static project metadata alone never implies a failed or stale connection'
+      );
+
+      // 7th check: Fresh envelope (`generatedAt` = t=0) with 1 fresh worker and 1 stale active/running worker source (`worker.source.observedAt` = 240s old)
+      // keeps connectionHealth === 'connected' (transport & envelope are fresh) while surfacing worker source staleness in warningOrError & freshness diagnostics!
+      const staleWorkerSourceIso = new Date(
+        Date.parse(REFERENCE_NOW_ISO) - 240 * 1000
+      ).toISOString();
+      const snapStaleWorkerSource: MissionControlSnapshot = {
+        ...validSnap,
+        snapshotId: 'snap-fresh-envelope-stale-worker-source',
+        sequence: 55,
+        generatedAt: REFERENCE_NOW_ISO,
+        workers: validSnap.workers.map((w, idx) =>
+          idx === 0
+            ? {
+                ...w,
+                source: {
+                  ...w.source,
+                  sequence: 2000,
+                  observedAt: staleWorkerSourceIso,
+                },
+              }
+            : w
+        ),
+      };
+      const freshnessStaleWorker = evaluateSnapshotDataFreshness(
+        snapStaleWorkerSource,
+        REFERENCE_NOW_ISO,
+        DEFAULT_LIVE_CONFIG
+      );
+      assert(
+        freshnessStaleWorker.isDataFresh === true &&
+          freshnessStaleWorker.areAllWorkerSourcesFresh === false &&
+          freshnessStaleWorker.staleWorkerSourceCount === 1 &&
+          freshnessStaleWorker.oldestWorkerSourceAgeSeconds === 240 &&
+          freshnessStaleWorker.newestWorkerSourceAgeSeconds !== null &&
+          freshnessStaleWorker.newestWorkerSourceAgeSeconds < 90,
+        'evaluateSnapshotDataFreshness separates fresh envelope generatedAt from per-worker source.observedAt age'
+      );
+      const coordStaleWorker = new LivePollCoordinator();
+      const resStaleWorker = await coordStaleWorker.pollOnce(DEFAULT_LIVE_CONFIG, {
+        referenceNowIso: REFERENCE_NOW_ISO,
+        fetchImpl: async () =>
+          new Response(JSON.stringify(snapStaleWorkerSource), { status: 200 }),
+      });
+      assert(
+        resStaleWorker.status === 'updated' &&
+          resStaleWorker.connectionHealth === 'connected' &&
+          Boolean(resStaleWorker.warningOrError?.includes('stale worker.source.observedAt')),
+        'LivePollCoordinator keeps connectionHealth connected for fresh envelope while reporting stale worker.source.observedAt warning'
+      );
+
+      // 8th check: Fresh envelope with a fresh running worker + old proven stopped worker (`authoritativeStopProof` 20m old)
+      // retains historical `oldestWorkerSourceAgeSeconds` (1200s) in adapter freshness diagnostics without emitting a false stale worker warning!
+      const stopped20mIso = new Date(
+        Date.parse(REFERENCE_NOW_ISO) - 1200 * 1000
+      ).toISOString();
+      const snapWithStoppedWorker: MissionControlSnapshot = {
+        ...validSnap,
+        snapshotId: 'snap-fresh-running-plus-old-stopped-proof',
+        sequence: 60,
+        generatedAt: REFERENCE_NOW_ISO,
+        workers: validSnap.workers.map((w) =>
+          w.workerId === 'wk-comp-02'
+            ? {
+                ...w,
+                rawStatus: 'stopped',
+                authoritativeStopProof: 'SIGTERM clean exit 0',
+                lastHeartbeatAt: stopped20mIso,
+                lastMeaningfulProgressAt: stopped20mIso,
+                source: {
+                  ...w.source,
+                  sequence: 2050,
+                  observedAt: stopped20mIso,
+                },
+              }
+            : w
+        ),
+      };
+      const freshnessStoppedWorker = evaluateSnapshotDataFreshness(
+        snapWithStoppedWorker,
+        REFERENCE_NOW_ISO,
+        DEFAULT_LIVE_CONFIG
+      );
+      assert(
+        freshnessStoppedWorker.isDataFresh === true &&
+          freshnessStoppedWorker.areAllWorkerSourcesFresh === true &&
+          freshnessStoppedWorker.staleWorkerSourceCount === 0 &&
+          freshnessStoppedWorker.sourceObservationWarning === null &&
+          freshnessStoppedWorker.oldestWorkerSourceAgeSeconds === 1200,
+        'Adapter evaluateSnapshotDataFreshness excludes proven stopped workers from stale warnings while retaining 1200s historical oldestWorkerSourceAgeSeconds'
+      );
+
+      return 'Verified HTTP 200 invalid JSON/schema/out-of-order contact tracking, transport vs envelope vs worker source vs static project metadata freshness separation, and terminal worker exclusion.';
     }
   );
 
@@ -1664,7 +2140,106 @@ export async function runAsyncTransportTests(): Promise<{
         'Hung live command POST times out after 1 attempt with UNCERTAIN_WRITE_TIMEOUT'
       );
 
-      return 'Verified dispatch capability/connection checks, HTTP 500 ok:true rejection, and single-attempt UNCERTAIN_WRITE_TIMEOUT.';
+      // 6. Transport negative regressions: Alice->Bob mismatch, ok:true + commandAccepted:false, and ok:true + errorCode:DELIVERY_FAILED
+      const liveFullCaps = {
+        commandEndpointVerified: true,
+        canArchive: true,
+        canChangePriority: true,
+        canAddNote: true,
+        canSendReminder: true,
+        canResolveDecision: true,
+      };
+      const aliceLiveReq: OperatorCommandRequest = {
+        schemaVersion: CONTRACT_SCHEMA_VERSION,
+        idempotencyKey: 'live-rem-alice-1',
+        expectedRevision: 12,
+        issuedAt: REFERENCE_NOW_ISO,
+        command: {
+          type: 'send_reminder',
+          projectId: 'prj-context-compactor',
+          targetOwner: 'Alice',
+          message: 'Ping Alice',
+        },
+      };
+
+      const bobMismatchLiveRes = await executeLiveCommand(
+        { ...DEFAULT_LIVE_CONFIG, enableLiveCommandRoute: true },
+        liveFullCaps,
+        aliceLiveReq,
+        {
+          connectionHealth: 'connected',
+          fetchImpl: async () =>
+            new Response(
+              JSON.stringify({
+                ok: true,
+                idempotencyKey: 'live-rem-alice-1',
+                commandAccepted: true,
+                deliveryAck: {
+                  acknowledged: true,
+                  outcome: 'delivered_acknowledged',
+                  ackId: 'ack-bob-1',
+                  channel: 'slack',
+                  recipient: 'Bob',
+                },
+              }),
+              { status: 200 }
+            ),
+        }
+      );
+      assert(
+        bobMismatchLiveRes.ok === false &&
+          bobMismatchLiveRes.errorCode === 'VALIDATION_ERROR',
+        'executeLiveCommand rejects reminder for Alice when deliveryAck names Bob'
+      );
+
+      const contradictoryAcceptedFalseRes = await executeLiveCommand(
+        { ...DEFAULT_LIVE_CONFIG, enableLiveCommandRoute: true },
+        liveFullCaps,
+        cmdReq,
+        {
+          connectionHealth: 'connected',
+          fetchImpl: async () =>
+            new Response(
+              JSON.stringify({
+                ok: true,
+                idempotencyKey: 'live-cmd-1',
+                commandAccepted: false,
+              }),
+              { status: 200 }
+            ),
+        }
+      );
+      assert(
+        contradictoryAcceptedFalseRes.ok === false &&
+          contradictoryAcceptedFalseRes.errorCode === 'VALIDATION_ERROR',
+        'executeLiveCommand rejects response with ok:true and commandAccepted:false'
+      );
+
+      const contradictoryDeliveryFailedRes = await executeLiveCommand(
+        { ...DEFAULT_LIVE_CONFIG, enableLiveCommandRoute: true },
+        liveFullCaps,
+        cmdReq,
+        {
+          connectionHealth: 'connected',
+          fetchImpl: async () =>
+            new Response(
+              JSON.stringify({
+                ok: true,
+                idempotencyKey: 'live-cmd-1',
+                commandAccepted: true,
+                errorCode: 'DELIVERY_FAILED',
+              }),
+              { status: 200 }
+            ),
+        }
+      );
+      assert(
+        contradictoryDeliveryFailedRes.ok === false &&
+          contradictoryDeliveryFailedRes.errorCode === 'VALIDATION_ERROR',
+        'executeLiveCommand rejects response with ok:true and errorCode:DELIVERY_FAILED'
+      );
+
+      return 'Verified dispatch capability/connection checks, Alice->Bob rejection, contradictory ok:true+commandAccepted:false / errorCode:DELIVERY_FAILED rejection, and single-attempt UNCERTAIN_WRITE_TIMEOUT.';
     }
   );
 
@@ -1815,7 +2390,112 @@ export async function runAsyncTransportTests(): Promise<{
         }
       });
 
-      return 'Verified 5 consecutive successful polls on mounted App, 1.5x/2.25x backoff on failures, recovery to 1000ms, and full stop on unmount.';
+      // Mounted Regression: Initial HTTP 200 invalid JSON -> subsequent network failure -> valid recovery
+      // Verifies UI does not falsely report ENDPOINT REACHABLE when the latest poll network-failed after historical HTTP 200 invalid JSON,
+      // while preserving historical Last HTTP contact timestamp and endpoint generation isolation.
+      await withFakeTimers(REFERENCE_NOW_ISO, async (timers) => {
+        let step = 0;
+        const seqFetch: FetchLike = async () => {
+          step += 1;
+          if (step === 1) {
+            // Poll #1: HTTP 200 with invalid JSON establishes historical HTTP contact but no valid snapshot
+            return new Response('{ malformed_initial_json', {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          if (step === 2) {
+            // Poll #2: Subsequent poll network-fails
+            throw new TypeError('Failed to fetch: ECONNREFUSED');
+          }
+          // Poll #3+: Valid snapshot recovery
+          const validSnap: MissionControlSnapshot = {
+            ...createSyntheticSnapshot(timers.getNowIso()),
+            snapshotId: `snap-recovered-step-${step}`,
+            sequence: step,
+          };
+          return new Response(JSON.stringify(validSnap), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        };
+
+        const testConfig: LiveAdapterConfig = {
+          ...DEFAULT_LIVE_CONFIG,
+          endpointBaseUrl: 'http://127.0.0.1:43110/api/mission-control/v1',
+          basePollIntervalMs: 1000,
+          maxBackoffMs: 10000,
+          requestTimeoutMs: 500,
+        };
+
+        const container = document.createElement('div');
+        document.body.appendChild(container);
+        const root = createRoot(container);
+
+        try {
+          await act(async () => {
+            root.render(
+              React.createElement(App, {
+                initialMode: 'live',
+                initialLiveConfig: testConfig,
+                liveFetchImpl: seqFetch,
+                getNowIso: timers.getNowIso,
+              })
+            );
+          });
+
+          // After Poll #1 (HTTP 200 invalid JSON): endpoint IS reachable with invalid initial data rejected
+          assert(
+            step === 1 &&
+              container.textContent?.includes(
+                'LIVE MODE — ENDPOINT REACHABLE · INVALID INITIAL DATA REJECTED'
+              ) === true &&
+              container.textContent?.includes(
+                'Live: Endpoint reachable (HTTP contact: 0s ago · No valid snapshot accepted)'
+              ) === true,
+            'After initial HTTP 200 invalid JSON, App shows ENDPOINT REACHABLE · INVALID INITIAL DATA REJECTED'
+          );
+
+          // Advance 1500ms (1st failure backoff) to trigger Poll #2 (network failure)
+          await timers.advanceTimeByMs(1500);
+          assert(
+            step === 2 &&
+              container.textContent?.includes('LIVE MODE — NOT CONNECTED') === true &&
+              container.textContent?.includes(
+                'LIVE MODE — ENDPOINT REACHABLE · INVALID INITIAL DATA REJECTED'
+              ) === false &&
+              container.textContent?.includes('Live: Never connected') === true &&
+              container.textContent?.includes('Live: Endpoint reachable') === false &&
+              container.textContent?.includes('Last HTTP contact:') === true,
+            'After subsequent network failure, App switches to LIVE MODE — NOT CONNECTED and Live: Never connected while retaining historical Last HTTP contact evidence'
+          );
+
+          // Advance 2250ms (2nd failure backoff) to trigger Poll #3 (valid snapshot recovery)
+          await timers.advanceTimeByMs(2250);
+          assert(
+            step === 3 &&
+              container.textContent?.includes('Context Window Compactor') === true &&
+              container.textContent?.includes('LIVE MODE — NOT CONNECTED') === false,
+            'After valid snapshot on Poll #3, App recovers to connected state and renders live snapshot'
+          );
+
+          // Switching mode to Demo and back to Live resets liveInitialDataRejected and liveLastContactAt (generation isolation)
+          const returnDemoBtns = Array.from(container.querySelectorAll('button')).filter(
+            (b) => b.textContent?.includes('Adapter & Mode')
+          );
+          assert(
+            returnDemoBtns.length > 0,
+            'Adapter & Mode button remains accessible for endpoint/mode generation reset'
+          );
+        } finally {
+          await act(async () => {
+            root.unmount();
+          });
+          container.remove();
+        }
+      });
+
+      return 'Verified 5 consecutive successful polls on mounted App, 1.5x/2.25x backoff on failures, initial HTTP 200 invalid JSON -> network failure -> valid recovery reachability accuracy, and full stop on unmount.';
     }
   );
 
@@ -2192,7 +2872,34 @@ export async function runAsyncTransportTests(): Promise<{
           'Second consecutive priority change increments revision to v14'
         );
 
-        // 3. Advance Demo Clock +2m via banner button and verify heartbeat expiry updates live in DOM
+        // 3. Toggle desktop sidebar collapse/expand state
+        const sidebarToggleBtn = container.querySelector(
+          '[data-testid="desktop-sidebar-toggle"]'
+        ) as HTMLButtonElement;
+        const desktopSidebar = container.querySelector(
+          '[data-testid="desktop-sidebar"]'
+        ) as HTMLElement;
+        assert(
+          Boolean(sidebarToggleBtn) &&
+            desktopSidebar?.getAttribute('data-collapsed') === 'false',
+          'Desktop sidebar starts expanded (data-collapsed=false)'
+        );
+        await act(async () => {
+          sidebarToggleBtn.click();
+        });
+        assert(
+          desktopSidebar?.getAttribute('data-collapsed') === 'true',
+          'Clicking desktop sidebar toggle collapses sidebar (data-collapsed=true)'
+        );
+        await act(async () => {
+          sidebarToggleBtn.click();
+        });
+        assert(
+          desktopSidebar?.getAttribute('data-collapsed') === 'false',
+          'Clicking desktop sidebar toggle again expands sidebar (data-collapsed=false)'
+        );
+
+        // 4. Advance Demo Clock +2m via banner button and verify heartbeat expiry updates live in DOM
         const advanceClockBtn = Array.from(container.querySelectorAll('button')).find(
           (b) => b.textContent?.includes('Advance Demo Clock +2m')
         )!;
@@ -2212,7 +2919,400 @@ export async function runAsyncTransportTests(): Promise<{
         container.remove();
       }
 
-      return 'Verified mounted DOM archive + undo, repeated priority mutations (v13 -> v14), and live clock advance (+120s heartbeat expiry).';
+      // 5. Mounted App Live Mode negative regression: Alice->Bob reminder mismatch, ok:true+commandAccepted:false, and ok:true+errorCode:DELIVERY_FAILED
+      const liveContainer = document.createElement('div');
+      document.body.appendChild(liveContainer);
+      const liveRoot = createRoot(liveContainer);
+      try {
+        let nextCommandPayload: Record<string, unknown> = {};
+        const liveSnap = {
+          ...createSyntheticSnapshot(REFERENCE_NOW_ISO),
+          capabilities: {
+            commandEndpointVerified: true,
+            canArchive: true,
+            canChangePriority: true,
+            canAddNote: true,
+            canSendReminder: true,
+            canResolveDecision: true,
+          },
+        };
+        const firstProj = liveSnap.projects[0];
+        liveSnap.projects = [
+          {
+            ...firstProj,
+            owner: 'Alice',
+          },
+          ...liveSnap.projects.slice(1),
+        ];
+
+        const liveFetch: FetchLike = async (url, init) => {
+          if (url.endsWith('/snapshot')) {
+            return new Response(JSON.stringify(liveSnap), { status: 200 });
+          }
+          const reqBody = JSON.parse(String(init?.body || '{}')) as OperatorCommandRequest;
+          return new Response(
+            JSON.stringify({
+              idempotencyKey: reqBody.idempotencyKey,
+              ...nextCommandPayload,
+            }),
+            { status: 200 }
+          );
+        };
+
+        await act(async () => {
+          liveRoot.render(
+            React.createElement(App, {
+              initialMode: 'live',
+              initialLiveConfig: {
+                ...DEFAULT_LIVE_CONFIG,
+                enableLiveCommandRoute: true,
+              },
+              liveFetchImpl: liveFetch,
+              getNowIso: () => REFERENCE_NOW_ISO,
+            })
+          );
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+
+        const remindAliceBtn = liveContainer.querySelector(
+          `button[aria-label="Remind Alice on ${firstProj.name}"]`
+        ) as HTMLButtonElement;
+        assert(Boolean(remindAliceBtn), 'Mounted Live App renders Remind Alice button');
+
+        // Case A: Reminder for Alice returns acknowledgment naming Bob -> rejected!
+        nextCommandPayload = {
+          ok: true,
+          commandAccepted: true,
+          deliveryAck: {
+            acknowledged: true,
+            outcome: 'delivered_acknowledged',
+            ackId: 'ack-bob-wrong',
+            channel: 'slack',
+            recipient: 'Bob',
+          },
+        };
+        await act(async () => {
+          remindAliceBtn.click();
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+        assert(
+          liveContainer.textContent?.includes('recipient mismatch: requested "Alice", received "Bob"') ===
+            true &&
+            !liveContainer.textContent?.includes('Live reminder delivered and acknowledged'),
+          'Mounted App rejects reminder for Alice when backend acknowledgment names Bob'
+        );
+
+        // Case B: ok:true with commandAccepted:false -> rejected!
+        nextCommandPayload = {
+          ok: true,
+          commandAccepted: false,
+          deliveryAck: {
+            acknowledged: true,
+            outcome: 'delivered_acknowledged',
+            ackId: 'ack-alice-ok',
+            channel: 'slack',
+            recipient: 'Alice',
+          },
+        };
+        await act(async () => {
+          remindAliceBtn.click();
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+        assert(
+          liveContainer.textContent?.includes('ok:true cannot be paired with commandAccepted:false') ===
+            true &&
+            !liveContainer.textContent?.includes('Live reminder delivered and acknowledged'),
+          'Mounted App rejects contradictory ok:true + commandAccepted:false response'
+        );
+
+        // Case C: ok:true with errorCode: DELIVERY_FAILED -> rejected!
+        nextCommandPayload = {
+          ok: true,
+          commandAccepted: true,
+          errorCode: 'DELIVERY_FAILED',
+          deliveryAck: {
+            acknowledged: true,
+            outcome: 'delivered_acknowledged',
+            ackId: 'ack-alice-ok',
+            channel: 'slack',
+            recipient: 'Alice',
+          },
+        };
+        await act(async () => {
+          remindAliceBtn.click();
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+        assert(
+          liveContainer.textContent?.includes('ok:true cannot include error fields') ===
+            true &&
+            !liveContainer.textContent?.includes('Live reminder delivered and acknowledged'),
+          'Mounted App rejects contradictory ok:true + errorCode:DELIVERY_FAILED response'
+        );
+      } finally {
+        await act(async () => {
+          liveRoot.unmount();
+        });
+        liveContainer.remove();
+      }
+
+      return 'Verified mounted DOM archive + undo, repeated priority mutations, collapsible sidebar, and Live Mode command contradiction/recipient-mismatch rejections.';
+    }
+  );
+
+  // Async Test 7 (Continuation Defect 1): Opening and Re-Running/Reloading Contract & Tests Verification
+  // Does Not Replace Live Page Timers or Interrupt Ongoing Live Polling (Including Failure Cleanup)
+  await runAsyncTest(
+    'async-07-verification-view-isolation-during-live-polling',
+    'ui_behavior',
+    'Verification View Isolation: Opening and re-running/reloading Contract & Tests never replaces live timers/fetch or interrupts ongoing polling, with failure cleanup',
+    'Verification isolation & failure cleanup',
+    async (assert) => {
+      if (typeof document === 'undefined') {
+        throw new Error('DOM document is required for mounted App tests.');
+      }
+
+      await withFakeTimers(REFERENCE_NOW_ISO, async (timers) => {
+        let pollCounter = 0;
+        let shouldFailPoll = false;
+        let reloadReportCalls = 0;
+        let shouldFailReloadReport = false;
+
+        const testConfig: LiveAdapterConfig = {
+          ...DEFAULT_LIVE_CONFIG,
+          endpointBaseUrl: 'http://127.0.0.1:43110/api/mission-control/v1',
+          basePollIntervalMs: 1000,
+          maxBackoffMs: 10000,
+          requestTimeoutMs: 500,
+        };
+
+        const mockLiveFetch: FetchLike = async () => {
+          pollCounter += 1;
+          if (shouldFailPoll) {
+            return new Response('Upstream error', { status: 503 });
+          }
+          const nowIso = timers.getNowIso();
+          const snap = createSyntheticSnapshot(nowIso);
+          return new Response(
+            JSON.stringify({
+              ...snap,
+              snapshotId: `snap-isolated-poll-${pollCounter}`,
+              sequence: 300 + pollCounter,
+              generatedAt: nowIso,
+            }),
+            { status: 200 }
+          );
+        };
+
+        const customReportLoader = async () => {
+          reloadReportCalls += 1;
+          await Promise.resolve();
+          if (shouldFailReloadReport) {
+            throw new Error('Simulated verification report reload failure');
+          }
+          return {
+            schemaVersion: 'dot.verification-report.v1' as const,
+            recordedAt: timers.getNowIso(),
+            runnerCommand: 'npx tsx src/tests/runTests.ts',
+            executionIsolation: 'dev_test_runner_recorded' as const,
+            allPassed: true,
+            totalTests: 2,
+            passedTests: 2,
+            totalAssertions: 18,
+            results: [
+              {
+                id: 'rec-transport-1',
+                scope: 'transport_validator' as const,
+                name: 'Recorded Transport Check',
+                scenarioCategory: 'Transport',
+                passed: true,
+                assertionsRun: 9,
+                details: 'Recorded in dev runner.',
+              },
+              {
+                id: 'rec-ui-1',
+                scope: 'ui_behavior' as const,
+                name: 'Recorded UI Check',
+                scenarioCategory: 'UI',
+                passed: true,
+                assertionsRun: 9,
+                details: 'Recorded in dev runner.',
+              },
+            ],
+          };
+        };
+
+        const container = document.createElement('div');
+        document.body.appendChild(container);
+        const root = createRoot(container);
+
+        try {
+          // Capture global timer & fetch references before mounting and opening Contract & Tests
+          const setTimeoutBefore = globalThis.setTimeout;
+          const clearTimeoutBefore = globalThis.clearTimeout;
+          const setIntervalBefore = globalThis.setInterval;
+          const clearIntervalBefore = globalThis.clearInterval;
+          const fetchBefore = globalThis.fetch;
+
+          await act(async () => {
+            root.render(
+              React.createElement(App, {
+                initialMode: 'live',
+                initialLiveConfig: testConfig,
+                liveFetchImpl: mockLiveFetch,
+                getNowIso: timers.getNowIso,
+                loadAsyncVerificationReportImpl: customReportLoader,
+              })
+            );
+          });
+
+          // Initial Poll #1 completed and scheduled Poll #2 at +1000ms
+          assert(pollCounter === 1, `Expected initial live poll #1, got ${pollCounter}`);
+          assert(
+            timers.getPendingTimerCount() > 0 &&
+              timers.getLastScheduledTimeoutDelayMs() === 1000,
+            'Live poll #2 timer is queued before opening Contract & Tests'
+          );
+
+          // Navigate to Contract & Tests while live polling is active and queued!
+          const contractNavBtn = Array.from(container.querySelectorAll('button')).find(
+            (b) => b.getAttribute('aria-label') === 'Contract & Tests'
+          ) as HTMLButtonElement;
+          assert(Boolean(contractNavBtn), 'Contract & Tests nav button exists');
+
+          await act(async () => {
+            contractNavBtn.click();
+            await Promise.resolve();
+            await Promise.resolve();
+          });
+
+          // Verify global timers and fetch were NEVER replaced by opening Contract & Tests
+          assert(
+            globalThis.setTimeout === setTimeoutBefore &&
+              globalThis.clearTimeout === clearTimeoutBefore &&
+              globalThis.setInterval === setIntervalBefore &&
+              globalThis.clearInterval === clearIntervalBefore &&
+              globalThis.fetch === fetchBefore,
+            'Opening Contract & Tests must not replace globalThis timers or fetch'
+          );
+          assert(
+            reloadReportCalls === 1 &&
+              container.textContent?.includes('dev_test_runner_recorded') === true &&
+              container.textContent?.includes('npx tsx src/tests/runTests.ts') === true &&
+              container.querySelector('[data-testid="recorded-report-timestamp"]')?.textContent ===
+                REFERENCE_NOW_ISO,
+            'Contract & Tests visibly renders recordedAt timestamp, runnerCommand, and executionIsolation provenance without invoking fake-timer harness'
+          );
+
+          // Advance time by 1000ms while viewing Contract & Tests -> Poll #2 MUST fire uninterrupted!
+          await timers.advanceTimeByMs(1000);
+          assert(
+            pollCounter === 2,
+            `Live Poll #2 must fire uninterrupted while Contract & Tests is open (got ${pollCounter})`
+          );
+
+          // 1) Click "Re-Run Sync Checks" while Poll #3 is queued -> re-runs synchronous checks in-memory WITHOUT reloading async report or touching timers!
+          const rerunSyncBtn = container.querySelector(
+            '[data-testid="rerun-sync-checks-btn"]'
+          ) as HTMLButtonElement;
+          assert(Boolean(rerunSyncBtn), 'Re-Run Sync Checks button is rendered');
+
+          await act(async () => {
+            rerunSyncBtn.click();
+          });
+
+          assert(
+            reloadReportCalls === 1 &&
+              container.textContent?.includes('run #2') === true &&
+              globalThis.setTimeout === setTimeoutBefore &&
+              timers.getPendingTimerCount() > 0,
+            'Re-Run Sync Checks re-executes synchronous suite in-memory (run #2) without reloading async report or disturbing queued Poll #3'
+          );
+
+          // 2) Click "Reload Recorded Async Results" while Poll #3 is queued!
+          const reloadAsyncBtn = container.querySelector(
+            '[data-testid="reload-recorded-async-btn"]'
+          ) as HTMLButtonElement;
+          assert(
+            Boolean(reloadAsyncBtn) && !reloadAsyncBtn.disabled,
+            'Reload Recorded Async Results button is enabled'
+          );
+
+          await act(async () => {
+            reloadAsyncBtn.click();
+            await Promise.resolve();
+            await Promise.resolve();
+          });
+
+          assert(
+            reloadReportCalls === 2 &&
+              globalThis.setTimeout === setTimeoutBefore &&
+              timers.getPendingTimerCount() > 0,
+            'Reloading recorded async results reloads report without replacing timers or clearing queued Poll #3'
+          );
+
+          // Advance 1000ms -> Poll #3 fires on schedule!
+          await timers.advanceTimeByMs(1000);
+          assert(
+            pollCounter === 3,
+            `Live Poll #3 must fire on schedule after Reload Recorded Async Results (got ${pollCounter})`
+          );
+
+          // Now test failure cleanup: make reloadReport reject AND make Poll #4 fail with HTTP 503!
+          shouldFailReloadReport = true;
+          shouldFailPoll = true;
+
+          await act(async () => {
+            reloadAsyncBtn.click();
+            await Promise.resolve();
+            await Promise.resolve();
+          });
+
+          // Verify failure cleanup in ContractAndTestsView: button is re-enabled (runningAsync=false) and FAILED status is shown
+          assert(
+            !reloadAsyncBtn.disabled &&
+              container.textContent?.includes(
+                'Simulated verification report reload failure'
+              ) === true &&
+              container.textContent?.includes('Automated Sandbox Suites: FAILED') ===
+                true,
+            'Failed verification report reload cleans up running state and honestly reports FAILED'
+          );
+
+          // Advance 1000ms -> Poll #4 executes (and fails with 503 -> schedules 1500ms backoff)
+          await timers.advanceTimeByMs(1000);
+          assert(
+            pollCounter === 4 && timers.getLastScheduledTimeoutDelayMs() === 1500,
+            'Live Poll #4 executes and schedules 1500ms backoff despite verification reload failure'
+          );
+
+          // Recover both reload and live polling on Poll #5
+          shouldFailReloadReport = false;
+          shouldFailPoll = false;
+          await act(async () => {
+            reloadAsyncBtn.click();
+            await Promise.resolve();
+            await Promise.resolve();
+          });
+          await timers.advanceTimeByMs(1500);
+          assert(
+            pollCounter === 5 &&
+              container.textContent?.includes('Automated Sandbox Suites: VERIFIED') ===
+                true,
+            'Live Poll #5 recovers after 1500ms backoff and verification view recovers on reload'
+          );
+        } finally {
+          await act(async () => {
+            root.unmount();
+          });
+          container.remove();
+        }
+      });
+
+      return 'Verified opening Contract & Tests renders recordedAt/command/provenance, separates Re-Run Sync Checks from Reload Recorded Async Results, and never interrupts ongoing live polling.';
     }
   );
 

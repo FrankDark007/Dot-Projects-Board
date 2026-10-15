@@ -1,8 +1,20 @@
 /**
  * @file src/components/ProjectRow.tsx
- * @description Linear-inspired compact project row (default view) showing project name,
+ * @description Linear-inspired space-aware project row (default view) showing project name,
  * owner, current milestone, next action, truthful activity status (separating confirmed
- * running from unknown), and blocker without excessive clutter.
+ * running from unknown), and blocker without overlap or hidden truncation.
+ *
+ * Layout Architecture:
+ * - Uses CSS container queries (`@container`) and `minmax(0, ...)` grid tracks without
+ *   rigid 12-column `col-span` squeezing.
+ * - When available row content width is < 980px (including narrow viewports, 200% zoom,
+ *   or expanded sidebar on medium screens), the action controls automatically move onto
+ *   a separate wrapping row below the text columns.
+ * - When available row content width is >= 980px, the actions column occupies an `auto`
+ *   track sized to its controls while text columns share `minmax(0, 1fr)`.
+ * - All text/status containers enforce `min-w-0` and `[overflow-wrap:anywhere]` so long
+ *   project names, long owner names, and unbroken strings wrap cleanly without clipping
+ *   or overlapping controls.
  */
 
 import React from 'react';
@@ -101,14 +113,18 @@ export const ProjectRow: React.FC<ProjectRowProps> = ({
     if (stalled > 0) {
       segments.push(`${stalled} alive (stalled)`);
     }
-    if (confirmed === 0 && workerSummary.unknownExecutionCount === 0 && workerSummary.crashedOrFailedCount === 0) {
+    if (
+      confirmed === 0 &&
+      workerSummary.unknownExecutionCount === 0 &&
+      workerSummary.crashedOrFailedCount === 0
+    ) {
       segments.push('0 running');
     }
     if (workerSummary.crashedOrFailedCount > 0) {
       segments.push(`${workerSummary.crashedOrFailedCount} crashed`);
     }
     if (workerSummary.unknownExecutionCount > 0) {
-      segments.push(`${workerSummary.unknownExecutionCount} unknown (hb expired)`);
+      segments.push(`${workerSummary.unknownExecutionCount} unknown (hb/obs expired)`);
     }
     return segments.join(' · ');
   };
@@ -116,83 +132,101 @@ export const ProjectRow: React.FC<ProjectRowProps> = ({
   return (
     <div
       data-testid={`project-row-${project.projectId}`}
-      className={`group border-b last:border-b-0 border-slate-200 dark:border-slate-800 px-4 py-3.5 transition-colors ${
+      className={`@container group border-b last:border-b-0 border-slate-200 dark:border-slate-800 px-4 py-3.5 transition-colors ${
         isSelected
           ? 'bg-sky-50/70 dark:bg-sky-950/30'
           : 'bg-white dark:bg-[#111827] hover:bg-slate-50/80 dark:hover:bg-slate-900/50'
       }`}
     >
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-start lg:items-center">
-        {/* Col 1-4: Project Name, Status, Owner & Last Update */}
-        <div className="lg:col-span-4 min-w-0">
-          <div className="flex items-center gap-2 text-xs mb-1">
-            <span className={`inline-flex items-center gap-1.5 ${getStatusTextColor()}`}>
-              {renderStatusIcon()}
-              <span className="truncate">{primaryStatusLabel}</span>
-            </span>
-            <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
-              ·
-            </span>
-            <span className="text-slate-500 dark:text-slate-400 truncate">
-              {project.owner}
-            </span>
-          </div>
-
-          <button
-            type="button"
-            onClick={() => onSelectProject(project.projectId)}
-            title={project.name}
-            className="text-sm font-semibold text-slate-900 dark:text-slate-100 hover:text-sky-600 dark:hover:text-sky-400 text-left truncate block w-full cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-600 rounded"
-          >
-            {project.name}
-          </button>
-
-          <div className="flex flex-wrap items-center gap-1.5 text-[11px] font-mono text-slate-500 dark:text-slate-400 tabular-nums mt-0.5">
-            <span>{renderCompactWorkerActivity()}</span>
-            <span aria-hidden="true">·</span>
-            <span>Updated {formatRelativeAge(lastVerifiedUpdateAt, referenceNowIso)}</span>
-          </div>
-        </div>
-
-        {/* Col 5-7: Current Milestone & Remaining Work */}
-        <div className="lg:col-span-3 min-w-0 text-xs">
-          <div
-            className="font-medium text-slate-800 dark:text-slate-200 truncate"
-            title={currentMilestone ? currentMilestone.title : 'All Milestones Complete'}
-          >
-            {currentMilestone ? currentMilestone.title : 'All Milestones Complete'}
-          </div>
-          <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 tabular-nums mt-0.5">
-            {remainingMilestoneCount}/{totalMilestoneCount} milestones left · {remainingStepCount}{' '}
-            steps
-          </div>
-        </div>
-
-        {/* Col 8-10: Next Action or Blocker */}
-        <div className="lg:col-span-3 min-w-0 text-xs">
-          {project.blocker ? (
-            <div
-              className={
-                project.blocker.isConfirmedFailure
-                  ? 'text-red-700 dark:text-red-400'
-                  : 'text-amber-800 dark:text-amber-300'
-              }
-            >
-              <span className="font-semibold">
-                {project.blocker.isConfirmedFailure ? 'Blocker (Failure): ' : 'Blocker: '}
+      <div className="grid grid-cols-1 @[920px]:grid-cols-[minmax(0,1fr)_auto] gap-3.5 items-start">
+        {/* Space-Aware Text Columns: stacks on narrow widths, 3 minmax(0, ...) columns when >= 640px */}
+        <div className="min-w-0 grid grid-cols-1 @[640px]:grid-cols-[minmax(0,1.35fr)_minmax(0,1fr)_minmax(0,1.25fr)] gap-3.5 items-start">
+          {/* Column 1: Project Name, Status, Owner & Last Update */}
+          <div data-testid={`project-row-primary-${project.projectId}`} className="min-w-0">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs mb-1 min-w-0">
+              <span className={`inline-flex items-center gap-1.5 min-w-0 ${getStatusTextColor()}`}>
+                {renderStatusIcon()}
+                <span className="min-w-0 break-words [overflow-wrap:anywhere]">
+                  {primaryStatusLabel}
+                </span>
               </span>
-              <span className="line-clamp-2">{project.blocker.summary}</span>
+              <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
+                ·
+              </span>
+              <span
+                data-testid={`project-row-owner-${project.projectId}`}
+                className="text-slate-500 dark:text-slate-400 min-w-0 break-words [overflow-wrap:anywhere]"
+              >
+                {project.owner}
+              </span>
             </div>
-          ) : (
-            <div className="text-slate-600 dark:text-slate-300 line-clamp-2">
-              <span className="font-medium text-slate-800 dark:text-slate-200">Next: </span>
-              {project.nextAction}
+
+            <button
+              type="button"
+              onClick={() => onSelectProject(project.projectId)}
+              title={project.name}
+              className="text-sm font-semibold text-slate-900 dark:text-slate-100 hover:text-sky-600 dark:hover:text-sky-400 text-left block w-full min-w-0 break-words [overflow-wrap:anywhere] whitespace-normal leading-snug cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-600 rounded"
+            >
+              {project.name}
+            </button>
+
+            <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] font-mono text-slate-500 dark:text-slate-400 tabular-nums mt-1 min-w-0">
+              <span className="min-w-0 break-words [overflow-wrap:anywhere]">
+                {renderCompactWorkerActivity()}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span className="min-w-0 break-words [overflow-wrap:anywhere]">
+                Updated {formatRelativeAge(lastVerifiedUpdateAt, referenceNowIso)}
+              </span>
             </div>
-          )}
+          </div>
+
+          {/* Column 2: Current Milestone & Remaining Work */}
+          <div data-testid={`project-row-milestone-${project.projectId}`} className="min-w-0 text-xs">
+            <div
+              className="font-medium text-slate-800 dark:text-slate-200 min-w-0 break-words [overflow-wrap:anywhere] leading-snug"
+              title={currentMilestone ? currentMilestone.title : 'All Milestones Complete'}
+            >
+              {currentMilestone ? currentMilestone.title : 'All Milestones Complete'}
+            </div>
+            <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 tabular-nums mt-0.5 min-w-0 break-words [overflow-wrap:anywhere]">
+              {remainingMilestoneCount}/{totalMilestoneCount} milestones left ·{' '}
+              {remainingStepCount} steps
+            </div>
+          </div>
+
+          {/* Column 3: Next Action or Blocker */}
+          <div
+            data-testid={`project-row-blocker-or-next-${project.projectId}`}
+            className="min-w-0 text-xs"
+          >
+            {project.blocker ? (
+              <div
+                className={`min-w-0 break-words [overflow-wrap:anywhere] leading-snug ${
+                  project.blocker.isConfirmedFailure
+                    ? 'text-red-700 dark:text-red-400'
+                    : 'text-amber-800 dark:text-amber-300'
+                }`}
+              >
+                <span className="font-semibold">
+                  {project.blocker.isConfirmedFailure ? 'Blocker (Failure): ' : 'Blocker: '}
+                </span>
+                <span>{project.blocker.summary}</span>
+              </div>
+            ) : (
+              <div className="text-slate-600 dark:text-slate-300 min-w-0 break-words [overflow-wrap:anywhere] leading-snug">
+                <span className="font-medium text-slate-800 dark:text-slate-200">Next: </span>
+                <span>{project.nextAction}</span>
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* Col 11-12: Priority & Compact Controls */}
-        <div className="lg:col-span-2 flex items-center justify-end gap-1.5 shrink-0">
+        {/* Actions Column: Dedicated auto-sized track when wide (>=920px), separate wrapping row when narrower */}
+        <div
+          data-testid={`project-row-actions-${project.projectId}`}
+          className="min-w-0 flex flex-wrap items-center justify-start @[920px]:justify-end gap-2 pt-2 @[920px]:pt-0 border-t @[920px]:border-t-0 border-slate-100 dark:border-slate-800/80"
+        >
           <select
             aria-label={`Priority for ${project.name}`}
             value={project.priority}
@@ -205,7 +239,7 @@ export const ProjectRow: React.FC<ProjectRowProps> = ({
             onChange={(e) =>
               onChangePriority(project.projectId, e.target.value as PriorityLevel)
             }
-            className="text-xs font-medium bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2 py-1 text-slate-700 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-sky-600 disabled:opacity-50 cursor-pointer"
+            className="min-h-[34px] max-w-full text-xs font-medium bg-slate-50 dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded px-2.5 py-1.5 text-slate-700 dark:text-slate-200 focus:outline-none focus:ring-2 focus:ring-sky-600 disabled:opacity-50 cursor-pointer"
           >
             <option value="critical">Critical</option>
             <option value="high">High</option>
@@ -229,9 +263,9 @@ export const ProjectRow: React.FC<ProjectRowProps> = ({
               )
             }
             aria-label={`Remind ${project.owner} on ${project.name}`}
-            className="p-1.5 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+            className="min-h-[34px] min-w-[34px] px-2.5 py-1.5 inline-flex items-center justify-center text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
           >
-            <Bell className="w-3.5 h-3.5" />
+            <Bell className="w-3.5 h-3.5 shrink-0" />
           </button>
 
           <button
@@ -248,12 +282,12 @@ export const ProjectRow: React.FC<ProjectRowProps> = ({
             aria-label={
               project.archived ? `Unarchive ${project.name}` : `Archive ${project.name}`
             }
-            className="p-1.5 text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+            className="min-h-[34px] min-w-[34px] px-2.5 py-1.5 inline-flex items-center justify-center text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
           >
             {project.archived ? (
-              <ArchiveRestore className="w-3.5 h-3.5" />
+              <ArchiveRestore className="w-3.5 h-3.5 shrink-0" />
             ) : (
-              <Archive className="w-3.5 h-3.5" />
+              <Archive className="w-3.5 h-3.5 shrink-0" />
             )}
           </button>
 
@@ -261,9 +295,9 @@ export const ProjectRow: React.FC<ProjectRowProps> = ({
             type="button"
             onClick={() => onSelectProject(project.projectId)}
             aria-label={`Open side panel for ${project.name}`}
-            className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            className="min-h-[34px] inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 dark:text-slate-200 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 rounded transition-colors cursor-pointer"
           >
-            <PanelRightOpen className="w-3.5 h-3.5" />
+            <PanelRightOpen className="w-3.5 h-3.5 shrink-0" />
             <span>Details</span>
           </button>
         </div>

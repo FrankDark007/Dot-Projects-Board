@@ -16,7 +16,10 @@
  *    HTTP status, response shape, exact idempotencyKey, and deliveryAck semantics, and never auto-retry timeouts.
  */
 
-import { deduplicateSnapshot } from '../engine/stateEvaluator';
+import {
+  deduplicateSnapshot,
+  isProvenStoppedOrTerminalWorker,
+} from '../engine/stateEvaluator';
 import { createSyntheticSnapshot, REFERENCE_NOW_ISO } from '../fixtures/syntheticFixtures';
 import {
   ActivityEvent,
@@ -631,6 +634,7 @@ export async function fetchLiveSnapshot(
     referenceNowIso?: string;
     previousValidSnapshot?: MissionControlSnapshot | null;
     fetchImpl?: FetchLike;
+    onHttpResponseContact?: (contactIso: string, status: number) => void;
   }
 ): Promise<MissionControlSnapshot> {
   const fetchFn: FetchLike = options?.fetchImpl ?? ((input, init) => fetch(input, init));
@@ -672,7 +676,24 @@ export async function fetchLiveSnapshot(
       throw new Error(`HTTP ${response.status} ${response.statusText} from ${url}`);
     }
 
-    const body: unknown = await response.json();
+    // Record HTTP transport contact immediately when an HTTP 2xx response arrives,
+    // independently of whether JSON parsing or schema/sequence validation succeeds.
+    const contactIso = options?.referenceNowIso ?? new Date().toISOString();
+    options?.onHttpResponseContact?.(contactIso, response.status);
+
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch (parseErr) {
+      const detail =
+        parseErr instanceof Error
+          ? parseErr.message
+          : 'Unable to parse HTTP response body as JSON';
+      throw new SnapshotValidationError('INVALID_JSON', [
+        `HTTP ${response.status} response from ${url} is not valid JSON (${detail}).`,
+      ]);
+    }
+
     const validation = validateSnapshotPayload(body, {
       referenceNowIso: options?.referenceNowIso,
       previousValidSnapshot: options?.previousValidSnapshot,
@@ -891,59 +912,232 @@ export interface PollCycleOutcome {
   snapshot: MissionControlSnapshot | null;
   lastSuccessfulContactAt: string | null;
   snapshotGeneratedAt: string | null;
+  oldestWorkerSourceObservedAt?: string | null;
+  newestWorkerSourceObservedAt?: string | null;
+  sourceObservationWarning?: string | null;
   warningOrError: string | null;
 }
 
+export interface SnapshotFreshnessEvaluation {
+  /**
+   * True when the snapshot envelope generation timestamp (`snapshot.generatedAt`) is valid
+   * and within `staleLimitSeconds`. Old static project metadata alone never makes this false.
+   */
+  isDataFresh: boolean;
+  isEnvelopeFresh: boolean;
+  ageSeconds: number | null;
+  snapshotGeneratedAgeSeconds: number | null;
+  staleLimitSeconds: number;
+  /**
+   * Worker source observation freshness (`worker.source.observedAt`), tracked strictly separately
+   * from `snapshot.generatedAt`. Uses worst-case (oldest) covered worker observation so one fresh
+   * worker never masks a stale other worker.
+   */
+  workerSourceLimitSeconds: number;
+  oldestWorkerSourceObservedAt: string | null;
+  newestWorkerSourceObservedAt: string | null;
+  oldestWorkerSourceAgeSeconds: number | null;
+  newestWorkerSourceAgeSeconds: number | null;
+  staleWorkerIds: string[];
+  staleWorkerSourceCount: number;
+  freshWorkerSourceCount: number;
+  areAllWorkerSourcesFresh: boolean;
+  /**
+   * Static project metadata source observation age (`project.source.observedAt`).
+   * Tracked strictly as informational diagnostics; old static project metadata alone NEVER implies
+   * a failed or stale connection.
+   */
+  oldestProjectMetadataObservedAt: string | null;
+  oldestProjectMetadataAgeSeconds: number | null;
+  reason: string | null;
+  workerSourcesReason: string | null;
+  sourceObservationWarning: string | null;
+}
+
 /**
- * Evaluates whether a snapshot's own generation timestamp (`snapshot.generatedAt`) is fresh
- * relative to `referenceNowIso` and the configured `staleFeedWarningSeconds`.
- * Repeated HTTP 200 responses returning an old `generatedAt` will evaluate as stale!
+ * Evaluates snapshot envelope generation age (`snapshot.generatedAt`), per-worker source observation
+ * age (`worker.source.observedAt`), and static project metadata age (`project.source.observedAt`)
+ * separately relative to `referenceNowIso`.
+ *
+ * Key invariants:
+ * 1. Repeated HTTP 200 responses returning an old `snapshot.generatedAt` evaluate `isDataFresh: false`.
+ * 2. Worker source observations are evaluated across all covered workers: one fresh worker never masks
+ *    a stale other worker (`staleWorkerIds`, `staleWorkerSourceCount`, `oldestWorkerSourceAgeSeconds`, `areAllWorkerSourcesFresh`).
+ * 3. Old static project metadata (`project.source.observedAt`) alone never implies a failed or stale connection.
  */
 export function evaluateSnapshotDataFreshness(
   snapshot: MissionControlSnapshot,
   referenceNowIso: string,
   config: LiveAdapterConfig
-): {
-  isDataFresh: boolean;
-  ageSeconds: number | null;
-  staleLimitSeconds: number;
-  reason: string | null;
-} {
+): SnapshotFreshnessEvaluation {
   const staleLimitSeconds =
     snapshot.evaluationThresholds.staleFeedWarningSeconds ??
     Math.max(25, Math.ceil((config.basePollIntervalMs * 2.5) / 1000));
 
+  const workerSourceLimitSeconds =
+    snapshot.evaluationThresholds.heartbeatExpirySeconds > 0
+      ? snapshot.evaluationThresholds.heartbeatExpirySeconds
+      : staleLimitSeconds;
+
+  // 1. Evaluate per-worker source observation timestamps (`worker.source.observedAt`)
+  // Track BOTH newest and oldest (worst-case) across all covered workers for historical age diagnostics,
+  // while excluding proven stopped/terminal worker records from current execution uncertainty / stale warnings
+  // so an old stopped worker never masks or flags a fresh running worker, and a stale running sibling is always caught.
+  const coveredWorkers = snapshot.workers.filter((w) => w.coverageAvailable);
+  const nonTerminalCoveredWorkers = coveredWorkers.filter(
+    (w) => !isProvenStoppedOrTerminalWorker(w)
+  );
+  const staleWorkerIds: string[] = [];
+  let freshWorkerSourceCount = 0;
+  let oldestWorkerSourceObservedAt: string | null = null;
+  let newestWorkerSourceObservedAt: string | null = null;
+  let oldestWorkerSourceAgeSeconds: number | null = null;
+  let newestWorkerSourceAgeSeconds: number | null = null;
+
+  for (const w of coveredWorkers) {
+    const obsIso = w.source?.observedAt;
+    const obsEval = evaluateTimestamp(obsIso, referenceNowIso);
+    const isTerminalOrStopped = isProvenStoppedOrTerminalWorker(w);
+
+    if (!obsEval.valid || obsEval.ageSeconds === null) {
+      if (!isTerminalOrStopped) {
+        staleWorkerIds.push(w.workerId);
+      }
+      continue;
+    }
+
+    if (
+      oldestWorkerSourceAgeSeconds === null ||
+      obsEval.ageSeconds > oldestWorkerSourceAgeSeconds
+    ) {
+      oldestWorkerSourceAgeSeconds = obsEval.ageSeconds;
+      oldestWorkerSourceObservedAt = obsIso;
+    }
+
+    if (
+      newestWorkerSourceAgeSeconds === null ||
+      obsEval.ageSeconds < newestWorkerSourceAgeSeconds
+    ) {
+      newestWorkerSourceAgeSeconds = obsEval.ageSeconds;
+      newestWorkerSourceObservedAt = obsIso;
+    }
+
+    if (!isTerminalOrStopped) {
+      if (obsEval.ageSeconds > workerSourceLimitSeconds) {
+        staleWorkerIds.push(w.workerId);
+      } else {
+        freshWorkerSourceCount += 1;
+      }
+    }
+  }
+
+  const staleWorkerSourceCount = staleWorkerIds.length;
+  const areAllWorkerSourcesFresh = staleWorkerSourceCount === 0;
+  const sourceObservationWarning =
+    staleWorkerSourceCount > 0
+      ? `${staleWorkerSourceCount} of ${nonTerminalCoveredWorkers.length} active/non-terminal worker(s) have stale worker.source.observedAt (${staleWorkerIds.join(
+          ', '
+        )}; oldest observed ${
+          oldestWorkerSourceAgeSeconds !== null ? `${oldestWorkerSourceAgeSeconds}s ago` : 'invalid'
+        } > ${workerSourceLimitSeconds}s limit).`
+      : null;
+
+  // 2. Track static project metadata observation age (`project.source.observedAt`) strictly for diagnostics.
+  // Old static project metadata alone NEVER implies a failed or stale connection.
+  let oldestProjectMetadataObservedAt: string | null = null;
+  let oldestProjectMetadataAgeSeconds: number | null = null;
+  for (const p of snapshot.projects) {
+    const pObsIso = p.source?.observedAt;
+    const pObsEval = evaluateTimestamp(pObsIso, referenceNowIso);
+    if (pObsEval.valid && pObsEval.ageSeconds !== null) {
+      if (
+        oldestProjectMetadataAgeSeconds === null ||
+        pObsEval.ageSeconds > oldestProjectMetadataAgeSeconds
+      ) {
+        oldestProjectMetadataAgeSeconds = pObsEval.ageSeconds;
+        oldestProjectMetadataObservedAt = pObsIso;
+      }
+    }
+  }
+
+  // 3. Evaluate snapshot envelope generation age (`snapshot.generatedAt`)
   const genEval = evaluateTimestamp(snapshot.generatedAt, referenceNowIso);
   if (!genEval.valid || genEval.ageSeconds === null) {
     return {
       isDataFresh: false,
+      isEnvelopeFresh: false,
       ageSeconds: null,
+      snapshotGeneratedAgeSeconds: null,
       staleLimitSeconds,
+      workerSourceLimitSeconds,
+      oldestWorkerSourceObservedAt,
+      newestWorkerSourceObservedAt,
+      oldestWorkerSourceAgeSeconds,
+      newestWorkerSourceAgeSeconds,
+      staleWorkerIds,
+      staleWorkerSourceCount,
+      freshWorkerSourceCount,
+      areAllWorkerSourcesFresh,
+      oldestProjectMetadataObservedAt,
+      oldestProjectMetadataAgeSeconds,
       reason: `Snapshot generatedAt timestamp is invalid or in the future (${genEval.reason || 'invalid'}).`,
+      workerSourcesReason: sourceObservationWarning,
+      sourceObservationWarning,
     };
   }
 
   if (genEval.ageSeconds > staleLimitSeconds) {
     return {
       isDataFresh: false,
+      isEnvelopeFresh: false,
       ageSeconds: genEval.ageSeconds,
+      snapshotGeneratedAgeSeconds: genEval.ageSeconds,
       staleLimitSeconds,
+      workerSourceLimitSeconds,
+      oldestWorkerSourceObservedAt,
+      newestWorkerSourceObservedAt,
+      oldestWorkerSourceAgeSeconds,
+      newestWorkerSourceAgeSeconds,
+      staleWorkerIds,
+      staleWorkerSourceCount,
+      freshWorkerSourceCount,
+      areAllWorkerSourcesFresh,
+      oldestProjectMetadataObservedAt,
+      oldestProjectMetadataAgeSeconds,
       reason: `Transport reachable, but snapshot data is stale (generated ${genEval.ageSeconds}s ago > ${staleLimitSeconds}s freshness threshold).`,
+      workerSourcesReason: sourceObservationWarning,
+      sourceObservationWarning,
     };
   }
 
   return {
     isDataFresh: true,
+    isEnvelopeFresh: true,
     ageSeconds: genEval.ageSeconds,
+    snapshotGeneratedAgeSeconds: genEval.ageSeconds,
     staleLimitSeconds,
+    workerSourceLimitSeconds,
+    oldestWorkerSourceObservedAt,
+    newestWorkerSourceObservedAt,
+    oldestWorkerSourceAgeSeconds,
+    newestWorkerSourceAgeSeconds,
+    staleWorkerIds,
+    staleWorkerSourceCount,
+    freshWorkerSourceCount,
+    areAllWorkerSourcesFresh,
+    oldestProjectMetadataObservedAt,
+    oldestProjectMetadataAgeSeconds,
     reason: null,
+    workerSourcesReason: sourceObservationWarning,
+    sourceObservationWarning,
   };
 }
 
 /**
  * Stateful coordinator for Live Mode polling that prevents overlapping polls,
  * cancels in-flight requests on endpoint/mode switch, ignores late responses
- * from old generations, and separates transport contact time from snapshot data freshness.
+ * from old generations, and separates transport contact time, snapshot envelope generation age,
+ * and source observation age.
  */
 export class LivePollCoordinator {
   private generationId = 0;
@@ -1022,6 +1216,11 @@ export class LivePollCoordinator {
         referenceNowIso: contactIso,
         previousValidSnapshot: this.lastValidSnapshot,
         fetchImpl: options?.fetchImpl,
+        onHttpResponseContact: (httpContactIso) => {
+          if (myGeneration === this.generationId) {
+            this.lastSuccessfulContactAt = httpContactIso;
+          }
+        },
       });
 
       // If mode or endpoint changed while this request was in flight, ignore late response!
@@ -1039,14 +1238,14 @@ export class LivePollCoordinator {
       this.lastValidSnapshot = nextSnap;
       this.lastSuccessfulContactAt = contactIso;
 
-      // Separate HTTP transport success from snapshot data freshness!
+      // Separate HTTP transport success, snapshot envelope generation age, and worker source observation age!
       const freshness = evaluateSnapshotDataFreshness(nextSnap, contactIso, config);
       if (!freshness.isDataFresh) {
         this.connectionHealth = 'stale';
         this.lastErrorOrWarning = freshness.reason;
       } else {
         this.connectionHealth = 'connected';
-        this.lastErrorOrWarning = null;
+        this.lastErrorOrWarning = freshness.sourceObservationWarning;
       }
 
       return {
@@ -1055,6 +1254,9 @@ export class LivePollCoordinator {
         snapshot: nextSnap,
         lastSuccessfulContactAt: this.lastSuccessfulContactAt,
         snapshotGeneratedAt: nextSnap.generatedAt,
+        oldestWorkerSourceObservedAt: freshness.oldestWorkerSourceObservedAt,
+        newestWorkerSourceObservedAt: freshness.newestWorkerSourceObservedAt,
+        sourceObservationWarning: freshness.sourceObservationWarning,
         warningOrError: this.lastErrorOrWarning,
       };
     } catch (err) {
@@ -1070,10 +1272,15 @@ export class LivePollCoordinator {
       }
 
       const msg = err instanceof Error ? err.message : String(err);
-      this.lastErrorOrWarning = msg;
 
       if (err instanceof SnapshotValidationError) {
-        // Reject malformed or out-of-order snapshot, preserve lastValidSnapshot with warning
+        // Endpoint was reached over HTTP 200 (this.lastSuccessfulContactAt already advanced in onHttpResponseContact),
+        // but payload was invalid JSON, malformed schema, or out-of-order.
+        // Preserve lastValidSnapshot and report reachable transport with invalid-data warning!
+        const reachableInvalidWarning = this.lastValidSnapshot
+          ? `Endpoint reachable (HTTP 200 contact at ${this.lastSuccessfulContactAt}), but response payload was rejected as invalid/out-of-order — preserving last valid snapshot. ${msg}`
+          : `Endpoint reachable (HTTP 200 contact at ${this.lastSuccessfulContactAt}), but initial response payload was rejected as invalid. ${msg}`;
+        this.lastErrorOrWarning = reachableInvalidWarning;
         this.connectionHealth = this.lastValidSnapshot ? 'stale' : 'never_connected';
         return {
           status: 'rejected_validation_preserved_last',
@@ -1081,10 +1288,11 @@ export class LivePollCoordinator {
           snapshot: this.lastValidSnapshot,
           lastSuccessfulContactAt: this.lastSuccessfulContactAt,
           snapshotGeneratedAt: this.lastValidSnapshot?.generatedAt ?? null,
-          warningOrError: msg,
+          warningOrError: reachableInvalidWarning,
         };
       }
 
+      this.lastErrorOrWarning = msg;
       this.connectionHealth = this.lastValidSnapshot ? 'disconnected' : 'never_connected';
       return {
         status: 'network_error',
