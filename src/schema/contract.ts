@@ -31,9 +31,9 @@ export interface SourceAttribution {
 export type ConnectionHealthState =
   | 'demo_synthetic' // Explicit synthetic demo mode
   | 'never_connected' // Live mode configured, zero valid snapshots received yet
-  | 'connected' // Live mode with fresh valid snapshot
-  | 'stale' // Live mode with preserved valid snapshot whose age exceeds freshness threshold or had a transient poll warning
-  | 'disconnected'; // Live mode where endpoint failed after previously connecting (showing preserved last-known snapshot with warning)
+  | 'connected' // Live mode with fresh valid snapshot AND fresh transport contact
+  | 'stale' // Live mode where snapshot data age exceeds freshness threshold OR latest poll failed validation while preserving last valid snapshot
+  | 'disconnected'; // Live mode where transport endpoint failed after previously connecting (showing preserved last-known snapshot with warning)
 
 /**
  * 2. Worker Execution State
@@ -99,12 +99,12 @@ export interface CostTelemetry {
 export interface AcceptanceGate {
   gateId: string;
   label: string;
-  required: boolean; // Required gates MUST pass for Verified Complete; optional gate failures stay visible as warnings
+  required: boolean; // Required gates MUST pass and reference verified evidence for Verified Complete; optional gate failures stay visible as warnings
   status: 'passed' | 'failed' | 'pending' | 'skipped';
   verifiedAt: string | null;
   verifierSource: string | null;
   details: string;
-  evidenceId?: string;
+  evidenceId?: string | null;
 }
 
 export interface MilestoneNode {
@@ -387,8 +387,23 @@ export interface OperatorCommandRequest {
   command: CommandPayload;
 }
 
+export type DeliveryOutcome =
+  | 'delivered_acknowledged'
+  | 'accepted_pending_delivery'
+  | 'failed_delivery'
+  | 'uncertain_timeout';
+
+export type CommandErrorCode =
+  | 'CAPABILITY_UNSUPPORTED'
+  | 'LIVE_COMMANDS_UNCONFIGURED'
+  | 'REVISION_CONFLICT'
+  | 'DELIVERY_FAILED'
+  | 'UNCERTAIN_WRITE_TIMEOUT'
+  | 'NOT_CONNECTED'
+  | 'VALIDATION_ERROR';
+
 /**
- * Future Command Contract Response
+ * Command Contract Response
  * Strictly distinguishes:
  * - `commandAccepted`: Backend validated and persisted the request
  * - `deliveryAck.outcome`: Whether a downstream notification/action was actually delivered,
@@ -397,25 +412,20 @@ export interface OperatorCommandRequest {
 export interface OperatorCommandResponse {
   ok: boolean;
   idempotencyKey: string;
+  commandType?: CommandPayload['type'];
+  projectId?: string;
   commandAccepted?: boolean;
   deduplicatedReplay?: boolean;
   newRevision?: number;
   acknowledgedAt?: string;
   deliveryAck?: {
     acknowledged: boolean;
-    outcome?: 'delivered_acknowledged' | 'accepted_pending_delivery' | 'failed_delivery' | 'uncertain_timeout';
+    outcome?: DeliveryOutcome;
     ackId: string | null;
     channel: string;
     recipient: string;
     error?: string;
   };
-  errorCode?:
-    | 'CAPABILITY_UNSUPPORTED'
-    | 'LIVE_COMMANDS_UNCONFIGURED'
-    | 'REVISION_CONFLICT'
-    | 'DELIVERY_FAILED'
-    | 'UNCERTAIN_WRITE_TIMEOUT'
-    | 'NOT_CONNECTED'
-    | 'VALIDATION_ERROR';
+  errorCode?: CommandErrorCode;
   errorMessage?: string;
 }

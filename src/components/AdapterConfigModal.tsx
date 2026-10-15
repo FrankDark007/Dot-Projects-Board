@@ -46,9 +46,27 @@ export const AdapterConfigModal: React.FC<AdapterConfigModalProps> = ({
     return () => window.removeEventListener('keydown', handleKey);
   }, [onClose]);
 
-  const handleSaveConfig = (e: React.FormEvent) => {
+  const handleSaveConfig = (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
-    onUpdateLiveConfig(draftConfig);
+    const form = e.currentTarget;
+    const urlEl = form.querySelector('#endpoint-url') as HTMLInputElement | null;
+    const pollEl = form.querySelector('#poll-interval') as HTMLInputElement | null;
+    const timeoutEl = form.querySelector('#req-timeout') as HTMLInputElement | null;
+    const throttleEl = form.querySelector('#bg-throttle') as HTMLSelectElement | null;
+    const resolvedConfig: LiveAdapterConfig = {
+      ...draftConfig,
+      endpointBaseUrl: urlEl ? urlEl.value.trim() : draftConfig.endpointBaseUrl,
+      basePollIntervalMs: pollEl
+        ? Number(pollEl.value) || draftConfig.basePollIntervalMs
+        : draftConfig.basePollIntervalMs,
+      requestTimeoutMs: timeoutEl
+        ? Number(timeoutEl.value) || draftConfig.requestTimeoutMs
+        : draftConfig.requestTimeoutMs,
+      backgroundTabMultiplier: throttleEl
+        ? Number(throttleEl.value) || draftConfig.backgroundTabMultiplier
+        : draftConfig.backgroundTabMultiplier,
+    };
+    onUpdateLiveConfig(resolvedConfig);
     onClose();
   };
 

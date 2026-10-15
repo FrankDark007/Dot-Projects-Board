@@ -2,10 +2,10 @@
  * @file src/engine/stateEvaluator.ts
  * @description Pure, deterministic state evaluation and deduplication engine for `dot` Mission Control.
  * Enforces strict separation between:
- * 1) Project completion & acceptance verification (all required milestones & gates + valid evidence)
+ * 1) Project completion & acceptance verification (all required milestones & gates + valid verified evidence)
  * 2) Worker execution liveness vs meaningful progress vs coverage uncertainty
  * 3) Operator approval / decision state (confirmed failures vs missing info)
- * 4) Telemetry connection health
+ * 4) Telemetry connection health vs data freshness
  */
 
 import {
@@ -15,6 +15,7 @@ import {
   EvaluatedWorkerState,
   MissionControlSnapshot,
   ProjectRecord,
+  SourceAttribution,
   WorkerRecord,
 } from '../schema/contract';
 import { evaluateTimestamp } from '../utils/timeFormat';
@@ -114,43 +115,79 @@ export interface DeduplicationResult {
 }
 
 /**
- * Deduplicates entities in a snapshot by both primary ID and `source.sourceId`.
- * When duplicate IDs exist, preserves the record with the newer valid `source.observedAt` timestamp.
+ * Compares two `SourceAttribution` records to decide whether `incoming` is newer than `existing`.
+ * 1) If both share the same `emitterName` and both define numeric `sequence`, higher `sequence` wins.
+ * 2) Otherwise, newer valid `observedAt` timestamp wins.
+ */
+function isIncomingSourceNewer(
+  incoming: SourceAttribution,
+  existing: SourceAttribution
+): boolean {
+  if (
+    incoming.emitterName &&
+    incoming.emitterName === existing.emitterName &&
+    typeof incoming.sequence === 'number' &&
+    typeof existing.sequence === 'number' &&
+    incoming.sequence !== existing.sequence
+  ) {
+    return incoming.sequence > existing.sequence;
+  }
+
+  const incomingMs = Date.parse(incoming.observedAt);
+  const existingMs = Date.parse(existing.observedAt);
+  if (!Number.isNaN(incomingMs) && (Number.isNaN(existingMs) || incomingMs > existingMs)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Deduplicates entities in a snapshot by both primary ID and `source.sourceId`,
+ * applying explicit per-source sequence ordering (`source.sequence` within `source.emitterName`,
+ * then `source.observedAt`).
  */
 export function deduplicateSnapshot(raw: MissionControlSnapshot): DeduplicationResult {
   const dedupeByKey = <T>(
     items: T[],
     getId: (item: T) => string,
-    getSourceId: (item: T) => string,
-    getObservedAt: (item: T) => string
+    getSource: (item: T) => SourceAttribution
   ): { list: T[]; dropped: number } => {
     const byPrimary = new Map<string, T>();
-    const seenSourceIds = new Set<string>();
+    const primaryBySourceId = new Map<string, string>();
     let dropped = 0;
 
     for (const item of items) {
       const id = getId(item);
-      const sourceId = getSourceId(item);
+      const src = getSource(item);
+      const sourceId = src?.sourceId;
 
       if (byPrimary.has(id)) {
         dropped += 1;
         const existing = byPrimary.get(id)!;
-        const incomingMs = Date.parse(getObservedAt(item));
-        const existingMs = Date.parse(getObservedAt(existing));
-        if (!Number.isNaN(incomingMs) && (Number.isNaN(existingMs) || incomingMs > existingMs)) {
+        if (isIncomingSourceNewer(src, getSource(existing))) {
           byPrimary.set(id, item);
+          if (sourceId) {
+            primaryBySourceId.set(sourceId, id);
+          }
         }
         continue;
       }
 
-      if (sourceId && seenSourceIds.has(sourceId)) {
+      if (sourceId && primaryBySourceId.has(sourceId)) {
         dropped += 1;
+        const existingPrimaryId = primaryBySourceId.get(sourceId)!;
+        const existing = byPrimary.get(existingPrimaryId);
+        if (existing && isIncomingSourceNewer(src, getSource(existing))) {
+          byPrimary.delete(existingPrimaryId);
+          byPrimary.set(id, item);
+          primaryBySourceId.set(sourceId, id);
+        }
         continue;
       }
 
       byPrimary.set(id, item);
       if (sourceId) {
-        seenSourceIds.add(sourceId);
+        primaryBySourceId.set(sourceId, id);
       }
     }
 
@@ -160,47 +197,65 @@ export function deduplicateSnapshot(raw: MissionControlSnapshot): DeduplicationR
   const eventsRes = dedupeByKey<ActivityEvent>(
     raw.events,
     (e) => e.eventId,
-    (e) => e.source.sourceId,
-    (e) => e.source.observedAt
+    (e) => e.source
   );
   const workersRes = dedupeByKey<WorkerRecord>(
     raw.workers,
     (w) => w.workerId,
-    (w) => w.source.sourceId,
-    (w) => w.source.observedAt
+    (w) => w.source
   );
   const tasksRes = dedupeByKey(
     raw.tasks,
     (t) => t.taskId,
-    (t) => t.source.sourceId,
-    (t) => t.source.observedAt
+    (t) => t.source
   );
   const runsRes = dedupeByKey(
     raw.runs,
     (r) => r.runId,
-    (r) => r.source.sourceId,
-    (r) => r.source.observedAt
+    (r) => r.source
   );
   const decisionsRes = dedupeByKey(
     raw.decisions,
     (d) => d.decisionId,
-    (d) => d.source.sourceId,
-    (d) => d.source.observedAt
+    (d) => d.source
   );
   const evidenceRes = dedupeByKey(
     raw.evidence,
     (ev) => ev.evidenceId,
-    (ev) => ev.source.sourceId,
-    (ev) => ev.source.observedAt
+    (ev) => ev.source
   );
 
+  // Explicit deterministic event ordering:
+  // 1) Event timestamp descending
+  // 2) Per-source sequence descending when from same emitter
+  // 3) Source observedAt descending
+  // 4) eventId lexical tie-breaker
   const sortedEvents = [...eventsRes.list].sort((a, b) => {
     const aMs = Date.parse(a.timestamp);
     const bMs = Date.parse(b.timestamp);
-    if (Number.isNaN(aMs) && Number.isNaN(bMs)) return 0;
-    if (Number.isNaN(aMs)) return 1;
-    if (Number.isNaN(bMs)) return -1;
-    return bMs - aMs;
+    if (!Number.isNaN(aMs) && !Number.isNaN(bMs) && aMs !== bMs) {
+      return bMs - aMs;
+    }
+    if (Number.isNaN(aMs) && !Number.isNaN(bMs)) return 1;
+    if (!Number.isNaN(aMs) && Number.isNaN(bMs)) return -1;
+
+    if (
+      a.source?.emitterName &&
+      a.source.emitterName === b.source?.emitterName &&
+      typeof a.source.sequence === 'number' &&
+      typeof b.source.sequence === 'number' &&
+      a.source.sequence !== b.source.sequence
+    ) {
+      return b.source.sequence - a.source.sequence;
+    }
+
+    const aObs = Date.parse(a.source?.observedAt ?? '');
+    const bObs = Date.parse(b.source?.observedAt ?? '');
+    if (!Number.isNaN(aObs) && !Number.isNaN(bObs) && aObs !== bObs) {
+      return bObs - aObs;
+    }
+
+    return a.eventId.localeCompare(b.eventId);
   });
 
   const droppedDuplicates = {
@@ -286,7 +341,8 @@ export function evaluateWorker(
       heartbeatAgeSeconds,
       progressAgeSeconds,
       timestampWarning,
-      statusExplanation: 'Worker daemon disconnected from local supervisor; current state unconfirmed.',
+      statusExplanation:
+        'Worker daemon disconnected from local supervisor; current state unconfirmed.',
     };
   }
 
@@ -512,9 +568,10 @@ export function evaluateProject(
   const allOpenDecisions = snapshot.decisions.filter(
     (d) => d.projectId === project.projectId && d.status === 'open'
   );
-  const openDecisionsForMe = allOpenDecisions.filter(
-    (d) => d.owner.toLowerCase() === 'you' || d.owner.toLowerCase() === 'operator'
-  );
+  const openDecisionsForMe = allOpenDecisions.filter((d) => {
+    const ownerNorm = typeof d.owner === 'string' ? d.owner.trim().toLowerCase() : '';
+    return ownerNorm === 'you' || ownerNorm === 'operator';
+  });
 
   const approvalState: ApprovalState =
     openDecisionsForMe.length > 0 ? 'waiting_for_me' : 'none_required';
@@ -549,7 +606,8 @@ export function evaluateProject(
   let pendingRequiredGateCount = 0;
   let skippedRequiredGateCount = 0;
   let totalRequiredGateCount = 0;
-  let missingOrContradictoryEvidenceReason: string | null = null;
+  const milestonesMissingRequiredGates: string[] = [];
+  const evidenceOrGateProblems: string[] = [];
 
   const projectEvidenceMap = new Map(
     snapshot.evidence
@@ -557,20 +615,37 @@ export function evaluateProject(
       .map((ev) => [ev.evidenceId, ev])
   );
 
-  // Check if latestUsefulResult points to a missing or unverified evidence item
+  // Check if latestUsefulResult points to a missing, unverified, or invalid-timestamp evidence item
   if (project.latestUsefulResult?.evidenceId) {
     const linkedEv = projectEvidenceMap.get(project.latestUsefulResult.evidenceId);
     if (!linkedEv) {
-      missingOrContradictoryEvidenceReason = `Latest result references missing evidence "${project.latestUsefulResult.evidenceId}".`;
-    } else if (!linkedEv.verified) {
-      missingOrContradictoryEvidenceReason = `Latest result evidence "${linkedEv.evidenceId}" is marked unverified.`;
+      evidenceOrGateProblems.push(
+        `Latest result references missing evidence "${project.latestUsefulResult.evidenceId}".`
+      );
+    } else if (linkedEv.verified !== true) {
+      evidenceOrGateProblems.push(
+        `Latest result evidence "${linkedEv.evidenceId}" is marked unverified.`
+      );
+    } else if (
+      !evaluateTimestamp(linkedEv.createdAt, nowIso).valid ||
+      !evaluateTimestamp(linkedEv.source?.observedAt, nowIso).valid
+    ) {
+      evidenceOrGateProblems.push(
+        `Latest result evidence "${linkedEv.evidenceId}" has an invalid or future timestamp.`
+      );
     }
   }
 
   for (const m of project.milestones) {
     const isMilestoneRequired = m.required !== false;
+    const requiredGatesInMilestone = m.acceptanceGates.filter((g) => g.required === true);
+
+    if (isMilestoneRequired && requiredGatesInMilestone.length === 0) {
+      milestonesMissingRequiredGates.push(m.title || m.milestoneId);
+    }
+
     for (const g of m.acceptanceGates) {
-      const isGateRequired = isMilestoneRequired && g.required;
+      const isGateRequired = isMilestoneRequired && g.required === true;
       if (isGateRequired) {
         totalRequiredGateCount += 1;
       }
@@ -578,17 +653,41 @@ export function evaluateProject(
       if (g.status === 'passed') {
         passedGateCount += 1;
         if (isGateRequired) {
-          // Verify timestamp & evidence integrity on passed required gates
+          // 1) Required gate must have a valid, non-future verifiedAt timestamp
           const vTime = evaluateTimestamp(g.verifiedAt, nowIso);
           if (!vTime.valid) {
-            missingOrContradictoryEvidenceReason = `Required gate "${g.label}" has missing or invalid verifiedAt timestamp (${vTime.reason}).`;
+            evidenceOrGateProblems.push(
+              `Required gate "${g.label}" has missing or invalid verifiedAt timestamp (${vTime.reason}).`
+            );
           }
-          if (g.evidenceId) {
+
+          // 2) Required gate MUST reference an existing, verified evidence record with valid timestamps
+          if (typeof g.evidenceId !== 'string' || g.evidenceId.trim().length === 0) {
+            evidenceOrGateProblems.push(
+              `Required gate "${g.label}" does not reference any evidenceId.`
+            );
+          } else {
             const ev = projectEvidenceMap.get(g.evidenceId);
             if (!ev) {
-              missingOrContradictoryEvidenceReason = `Required gate "${g.label}" references missing evidence "${g.evidenceId}".`;
-            } else if (!ev.verified) {
-              missingOrContradictoryEvidenceReason = `Required gate "${g.label}" references unverified evidence "${g.evidenceId}".`;
+              evidenceOrGateProblems.push(
+                `Required gate "${g.label}" references missing evidence "${g.evidenceId}".`
+              );
+            } else if (ev.verified !== true) {
+              evidenceOrGateProblems.push(
+                `Required gate "${g.label}" references unverified evidence "${g.evidenceId}".`
+              );
+            } else {
+              const evCreatedEval = evaluateTimestamp(ev.createdAt, nowIso);
+              const evObservedEval = evaluateTimestamp(ev.source?.observedAt, nowIso);
+              if (!evCreatedEval.valid) {
+                evidenceOrGateProblems.push(
+                  `Required gate "${g.label}" evidence "${g.evidenceId}" has invalid createdAt (${evCreatedEval.reason}).`
+                );
+              } else if (!evObservedEval.valid) {
+                evidenceOrGateProblems.push(
+                  `Required gate "${g.label}" evidence "${g.evidenceId}" has invalid source.observedAt (${evObservedEval.reason}).`
+                );
+              }
             }
           }
         }
@@ -612,6 +711,9 @@ export function evaluateProject(
     }
   }
 
+  const missingOrContradictoryEvidenceReason =
+    evidenceOrGateProblems.length > 0 ? evidenceOrGateProblems[0] : null;
+
   // Check if a worker run finished its turn, but required acceptance failed
   const projectRuns = snapshot.runs.filter((r) => r.projectId === project.projectId);
   const hasSucceededTurn = projectRuns.some((r) => r.status === 'succeeded_turn');
@@ -621,14 +723,21 @@ export function evaluateProject(
 
   // Strict Verified Complete rules:
   // 1) acceptanceStatus === 'verified_passed'
-  // 2) At least 1 required milestone and 1 required gate exist
+  // 2) At least 1 required milestone exists, and EVERY required milestone has >= 1 required acceptance gate
   // 3) 0 remaining required milestones and 0 remaining required steps
   // 4) 0 failed, pending, or skipped required gates
-  // 5) No missing or contradictory evidence
-  // 6) No active blocker or open decision
+  // 5) Every required gate references existing, verified evidence with valid non-future timestamps
+  // 6) No active blocker or open decision, and 0 crashed/failed/stalled workers
   const strictCompletionReasons: string[] = [];
   if (requiredMilestones.length === 0) {
     strictCompletionReasons.push('No required milestones defined.');
+  }
+  if (milestonesMissingRequiredGates.length > 0) {
+    strictCompletionReasons.push(
+      `Required milestone(s) missing required acceptance gates: ${milestonesMissingRequiredGates.join(
+        ', '
+      )}.`
+    );
   }
   if (remainingRequiredMilestoneCount > 0) {
     strictCompletionReasons.push(
@@ -658,6 +767,12 @@ export function evaluateProject(
   }
   if (allOpenDecisions.length > 0) {
     strictCompletionReasons.push(`${allOpenDecisions.length} unresolved decision(s) remain open.`);
+  }
+  if (crashedOrFailedCount > 0) {
+    strictCompletionReasons.push(`${crashedOrFailedCount} worker(s) crashed or failed.`);
+  }
+  if (stalledProgressCount > 0) {
+    strictCompletionReasons.push(`${stalledProgressCount} worker(s) have stalled progress.`);
   }
 
   const isVerifiedComplete =

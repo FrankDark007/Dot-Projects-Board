@@ -1,9 +1,11 @@
 /**
  * @file src/components/ContractAndTestsView.tsx
  * @description Truthful Verification & Integration Contract inspector.
- * Separates Fixture/Evaluator tests, Mocked-HTTP Transport/Validator tests,
- * UI Rendering tests, and Real Local Integration (which remains UNVERIFIED until
- * connected to the local Mission Control / projectBoard backend).
+ * Dynamically derives every verification badge from actual completed test results for each scope:
+ * - Fixture & Evaluator Suite (`fixture_evaluator`)
+ * - Transport & Validator Suite (`transport_validator`)
+ * - Mounted UI & Isolation Suite (`ui_behavior`)
+ * - Real Local Integration (explicitly `UNVERIFIED IN SANDBOX`)
  */
 
 import React, { useEffect, useMemo, useState } from 'react';
@@ -12,6 +14,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronUp,
+  Clock,
   Code2,
   FileJson,
   Play,
@@ -27,9 +30,85 @@ import {
   runAllContractAndStateTests,
   runAsyncTransportTests,
   TestCaseResult,
+  TestSuiteScope,
 } from '../tests/contractAndState.test';
 
-export const ContractAndTestsView: React.FC = () => {
+export interface ContractAndTestsViewProps {
+  overrideSyncResults?: TestCaseResult[];
+  overrideAsyncResults?: TestCaseResult[];
+  overrideRunningAsync?: boolean;
+}
+
+interface ScopeVerificationSummary {
+  status: 'VERIFIED' | 'PENDING' | 'FAILED' | 'UNEXECUTED';
+  badgeLabel: string;
+  tone: 'verified' | 'warning' | 'danger';
+  passed: number;
+  total: number;
+  assertions: number;
+}
+
+export function deriveScopeVerificationSummary(
+  scope: TestSuiteScope,
+  results: TestCaseResult[],
+  isAsyncScopeRunning: boolean
+): ScopeVerificationSummary {
+  const scopeResults = results.filter((r) => r.scope === scope);
+  const total = scopeResults.length;
+  const passed = scopeResults.filter((r) => r.passed).length;
+  const failed = total - passed;
+  const assertions = scopeResults.reduce((acc, r) => acc + r.assertionsRun, 0);
+
+  if (failed > 0) {
+    return {
+      status: 'FAILED',
+      badgeLabel: isAsyncScopeRunning
+        ? `FAILED (${passed}/${total} passed · running...)`
+        : `FAILED (${passed}/${total} passed · ${failed} failed)`,
+      tone: 'danger',
+      passed,
+      total,
+      assertions,
+    };
+  }
+
+  if (isAsyncScopeRunning) {
+    return {
+      status: 'PENDING',
+      badgeLabel: `PENDING / RUNNING (${total} completed so far)`,
+      tone: 'warning',
+      passed,
+      total,
+      assertions,
+    };
+  }
+
+  if (total === 0) {
+    return {
+      status: 'UNEXECUTED',
+      badgeLabel: 'UNEXECUTED (0 tests run)',
+      tone: 'warning',
+      passed: 0,
+      total: 0,
+      assertions: 0,
+    };
+  }
+
+  return {
+    status: 'VERIFIED',
+    badgeLabel: `VERIFIED (${passed}/${total} passed · ${assertions} assertions)`,
+    tone: 'verified',
+    passed,
+    total,
+    assertions,
+  };
+}
+
+export const ContractAndTestsView: React.FC<ContractAndTestsViewProps> = ({
+  overrideSyncResults,
+  overrideAsyncResults,
+  overrideRunningAsync,
+}) => {
   const [reRunCounter, setReRunCounter] = useState(0);
   const [asyncResults, setAsyncResults] = useState<TestCaseResult[]>([]);
   const [runningAsync, setRunningAsync] = useState(true);
@@ -37,11 +116,25 @@ export const ContractAndTestsView: React.FC = () => {
   const [schemaView, setSchemaView] = useState<'snapshot' | 'command' | 'errors'>('snapshot');
 
   const syncSummary = useMemo(() => {
+    if (overrideSyncResults !== undefined) {
+      const passedTests = overrideSyncResults.filter((r) => r.passed).length;
+      return {
+        allPassed:
+          overrideSyncResults.length > 0 && passedTests === overrideSyncResults.length,
+        totalTests: overrideSyncResults.length,
+        passedTests,
+        totalAssertions: overrideSyncResults.reduce((s, r) => s + r.assertionsRun, 0),
+        results: overrideSyncResults,
+      };
+    }
     void reRunCounter;
     return runAllContractAndStateTests();
-  }, [reRunCounter]);
+  }, [reRunCounter, overrideSyncResults]);
 
   useEffect(() => {
+    if (overrideAsyncResults !== undefined || overrideRunningAsync !== undefined) {
+      return;
+    }
     let cancelled = false;
     setRunningAsync(true);
     void runAsyncTransportTests().then((res) => {
@@ -53,11 +146,86 @@ export const ContractAndTestsView: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [reRunCounter]);
+  }, [reRunCounter, overrideAsyncResults, overrideRunningAsync]);
 
-  const allResults = [...syncSummary.results, ...asyncResults];
+  const effectiveAsyncResults =
+    overrideAsyncResults !== undefined ? overrideAsyncResults : asyncResults;
+  const effectiveRunningAsync =
+    overrideRunningAsync !== undefined ? overrideRunningAsync : runningAsync;
+
+  const allResults = useMemo(
+    () => [...syncSummary.results, ...effectiveAsyncResults],
+    [syncSummary.results, effectiveAsyncResults]
+  );
+
   const passedCount = allResults.filter((r) => r.passed).length;
+  const failedCount = allResults.length - passedCount;
   const totalAssertions = allResults.reduce((acc, r) => acc + r.assertionsRun, 0);
+
+  const fixtureScopeSummary = useMemo(
+    () => deriveScopeVerificationSummary('fixture_evaluator', allResults, false),
+    [allResults]
+  );
+  const transportScopeSummary = useMemo(
+    () =>
+      deriveScopeVerificationSummary(
+        'transport_validator',
+        allResults,
+        effectiveRunningAsync
+      ),
+    [allResults, effectiveRunningAsync]
+  );
+  const uiScopeSummary = useMemo(
+    () =>
+      deriveScopeVerificationSummary('ui_behavior', allResults, effectiveRunningAsync),
+    [allResults, effectiveRunningAsync]
+  );
+
+  const overallBannerTone =
+    failedCount > 0
+      ? 'text-red-700 dark:text-red-400'
+      : effectiveRunningAsync || allResults.length === 0
+      ? 'text-amber-700 dark:text-amber-400'
+      : 'text-teal-700 dark:text-teal-400';
+
+  const renderScopeCard = (
+    title: string,
+    summary: ScopeVerificationSummary,
+    description: string
+  ) => {
+    const toneClass =
+      summary.tone === 'verified'
+        ? 'text-teal-700 dark:text-teal-400'
+        : summary.tone === 'danger'
+        ? 'text-red-700 dark:text-red-400'
+        : 'text-amber-800 dark:text-amber-400';
+
+    const borderClass =
+      summary.tone === 'danger'
+        ? 'border-red-300 dark:border-red-800/80 bg-red-50/30 dark:bg-red-950/20'
+        : summary.tone === 'warning'
+        ? 'border-amber-300 dark:border-amber-800/80 bg-amber-50/30 dark:bg-amber-950/20'
+        : 'border-slate-200 dark:border-slate-800';
+
+    return (
+      <div className={`border rounded-md p-3 ${borderClass}`}>
+        <div className="font-semibold text-slate-900 dark:text-slate-100 mb-1">
+          {title}
+        </div>
+        <div className={`font-mono font-semibold mb-1 flex items-center gap-1 ${toneClass}`}>
+          {summary.status === 'VERIFIED' ? (
+            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+          ) : summary.status === 'FAILED' ? (
+            <XCircle className="w-3.5 h-3.5 shrink-0" />
+          ) : (
+            <Clock className="w-3.5 h-3.5 shrink-0" />
+          )}
+          <span>{summary.badgeLabel}</span>
+        </div>
+        <p className="text-[11px] text-slate-600 dark:text-slate-400">{description}</p>
+      </div>
+    );
+  };
 
   return (
     <div className="space-y-6">
@@ -66,9 +234,23 @@ export const ContractAndTestsView: React.FC = () => {
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 mb-4 border-b border-slate-200 dark:border-slate-800">
           <div>
             <div className="flex flex-wrap items-center gap-2 text-xs mb-1">
-              <span className="inline-flex items-center gap-1 font-semibold text-teal-700 dark:text-teal-400">
-                <ShieldCheck className="w-4 h-4" />
-                <span>Automated Sandbox Suites: {passedCount}/{allResults.length} Passed</span>
+              <span className={`inline-flex items-center gap-1 font-semibold ${overallBannerTone}`}>
+                {failedCount > 0 ? (
+                  <XCircle className="w-4 h-4" />
+                ) : effectiveRunningAsync || allResults.length === 0 ? (
+                  <Clock className="w-4 h-4" />
+                ) : (
+                  <ShieldCheck className="w-4 h-4" />
+                )}
+                <span>
+                  {failedCount > 0
+                    ? `Automated Sandbox Suites: FAILED (${passedCount}/${allResults.length} Passed)`
+                    : effectiveRunningAsync
+                    ? `Automated Sandbox Suites: RUNNING (${passedCount}/${allResults.length} Completed)`
+                    : allResults.length === 0
+                    ? 'Automated Sandbox Suites: UNEXECUTED (0/0 Run)'
+                    : `Automated Sandbox Suites: VERIFIED (${passedCount}/${allResults.length} Passed)`}
+                </span>
               </span>
               <span aria-hidden="true" className="text-slate-300 dark:text-slate-700">
                 ·
@@ -85,68 +267,48 @@ export const ContractAndTestsView: React.FC = () => {
               </span>
             </div>
             <h2 className="text-base font-semibold text-slate-900 dark:text-slate-100">
-              Test Scope Separation: Fixture Logic, Mocked Transport, UI Rendering &amp; Local Integration
+              Test Scope Separation: Fixture Logic, Mocked Transport, Mounted UI Interaction &amp; Local Integration
             </h2>
           </div>
 
           <button
             type="button"
-            disabled={runningAsync}
+            disabled={effectiveRunningAsync}
             onClick={() => setReRunCounter((c) => c + 1)}
             className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-white bg-sky-600 hover:bg-sky-700 rounded transition-colors disabled:opacity-50 whitespace-nowrap shrink-0 cursor-pointer"
           >
             <Play className="w-3.5 h-3.5" />
-            <span>{runningAsync ? 'Running Suites...' : 'Re-Run All Suites'}</span>
+            <span>{effectiveRunningAsync ? 'Running Suites...' : 'Re-Run All Suites'}</span>
           </button>
         </div>
 
-        {/* 4-Column Scope Matrix */}
+        {/* 4-Column Scope Matrix — Dynamically Derived from Executed Test Results */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs mb-5">
-          <div className="border border-slate-200 dark:border-slate-800 rounded-md p-3">
-            <div className="font-semibold text-slate-900 dark:text-slate-100 mb-1">
-              1. Fixture &amp; Evaluator Suite
-            </div>
-            <div className="font-mono text-teal-700 dark:text-teal-400 mb-1">
-              VERIFIED (Deterministic Clock)
-            </div>
-            <p className="text-[11px] text-slate-600 dark:text-slate-400">
-              Tests heartbeat expiry without new snapshots, future timestamp skew, strict Verified
-              Complete gates, and liveness vs. stalled progress.
-            </p>
-          </div>
+          {renderScopeCard(
+            '1. Fixture & Evaluator Suite',
+            fixtureScopeSummary,
+            'Tests heartbeat expiry without new snapshots, future timestamp skew, strict Verified Complete evidence & milestone gates, and liveness vs. stalled progress.'
+          )}
 
-          <div className="border border-slate-200 dark:border-slate-800 rounded-md p-3">
-            <div className="font-semibold text-slate-900 dark:text-slate-100 mb-1">
-              2. Transport &amp; Validator Suite
-            </div>
-            <div className="font-mono text-teal-700 dark:text-teal-400 mb-1">
-              VERIFIED (Mocked HTTP)
-            </div>
-            <p className="text-[11px] text-slate-600 dark:text-slate-400">
-              Tests runtime schema validation, duplicate ID &amp; out-of-order rejection, hung
-              request timeouts, overlap guards, and late response cancellation.
-            </p>
-          </div>
+          {renderScopeCard(
+            '2. Transport & Validator Suite',
+            transportScopeSummary,
+            'Tests complete runtime field/reference validation, per-source sequence ordering, transport contact vs. data freshness, and live command response validation.'
+          )}
 
-          <div className="border border-slate-200 dark:border-slate-800 rounded-md p-3">
-            <div className="font-semibold text-slate-900 dark:text-slate-100 mb-1">
-              3. UI &amp; Isolation Suite
-            </div>
-            <div className="font-mono text-teal-700 dark:text-teal-400 mb-1">
-              VERIFIED (Component Render)
-            </div>
-            <p className="text-[11px] text-slate-600 dark:text-slate-400">
-              Tests compact rows, card views, disabled controls in read-only Live Mode, and
-              confirmed failure vs. missing info labels.
-            </p>
-          </div>
+          {renderScopeCard(
+            '3. Mounted UI & Isolation Suite',
+            uiScopeSummary,
+            'Tests mounted App continuous polling (5+ cycles, failures & recovery), endpoint isolation (A→B, A→B→A while pending), enabled/disabled controls, and repeated actions.'
+          )}
 
           <div className="border border-amber-300 dark:border-amber-800/80 bg-amber-50/40 dark:bg-amber-950/20 rounded-md p-3">
             <div className="font-semibold text-slate-900 dark:text-slate-100 mb-1">
               4. Real Local Integration
             </div>
-            <div className="font-mono font-semibold text-amber-800 dark:text-amber-400 mb-1">
-              UNVERIFIED IN SANDBOX
+            <div className="font-mono font-semibold text-amber-800 dark:text-amber-400 mb-1 flex items-center gap-1">
+              <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+              <span>UNVERIFIED IN SANDBOX</span>
             </div>
             <p className="text-[11px] text-slate-700 dark:text-slate-300">
               Requires wiring into your local Mission Control / projectBoard backend and running
@@ -167,42 +329,53 @@ export const ContractAndTestsView: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
-              {allResults.map((res) => (
-                <tr key={res.id} className="hover:bg-slate-50/80 dark:hover:bg-slate-900/40">
-                  <td className="py-2.5 px-3 whitespace-nowrap">
-                    {res.passed ? (
-                      <span className="inline-flex items-center gap-1 font-mono font-semibold text-teal-700 dark:text-teal-400">
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        <span>PASS</span>
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1 font-mono font-semibold text-red-700 dark:text-red-400">
-                        <XCircle className="w-3.5 h-3.5" />
-                        <span>FAIL</span>
-                      </span>
-                    )}
-                  </td>
-                  <td className="py-2.5 px-3 font-mono text-[11px] text-slate-600 dark:text-slate-400 whitespace-nowrap">
-                    {res.scope}
-                  </td>
-                  <td className="py-2.5 px-3 text-slate-700 dark:text-slate-300">
-                    <div className="font-semibold text-slate-900 dark:text-slate-100">
-                      {res.name}
-                    </div>
-                    <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
-                      {res.details}
-                    </div>
-                    {res.error && (
-                      <div className="text-[11px] font-mono text-red-700 dark:text-red-400 mt-1">
-                        {res.error}
-                      </div>
-                    )}
-                  </td>
-                  <td className="py-2.5 px-3 font-mono text-right tabular-nums text-slate-700 dark:text-slate-300">
-                    {res.assertionsRun}
+              {allResults.length === 0 ? (
+                <tr>
+                  <td
+                    colSpan={4}
+                    className="py-6 px-4 text-center font-mono text-amber-800 dark:text-amber-400"
+                  >
+                    UNEXECUTED — No test results have completed yet.
                   </td>
                 </tr>
-              ))}
+              ) : (
+                allResults.map((res) => (
+                  <tr key={res.id} className="hover:bg-slate-50/80 dark:hover:bg-slate-900/40">
+                    <td className="py-2.5 px-3 whitespace-nowrap">
+                      {res.passed ? (
+                        <span className="inline-flex items-center gap-1 font-mono font-semibold text-teal-700 dark:text-teal-400">
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          <span>PASS</span>
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 font-mono font-semibold text-red-700 dark:text-red-400">
+                          <XCircle className="w-3.5 h-3.5" />
+                          <span>FAIL</span>
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-2.5 px-3 font-mono text-[11px] text-slate-600 dark:text-slate-400 whitespace-nowrap">
+                      {res.scope}
+                    </td>
+                    <td className="py-2.5 px-3 text-slate-700 dark:text-slate-300">
+                      <div className="font-semibold text-slate-900 dark:text-slate-100">
+                        {res.name}
+                      </div>
+                      <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                        {res.details}
+                      </div>
+                      {res.error && (
+                        <div className="text-[11px] font-mono text-red-700 dark:text-red-400 mt-1">
+                          {res.error}
+                        </div>
+                      )}
+                    </td>
+                    <td className="py-2.5 px-3 font-mono text-right tabular-nums text-slate-700 dark:text-slate-300">
+                      {res.assertionsRun}
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>

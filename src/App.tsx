@@ -5,7 +5,6 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Activity,
   AlertTriangle,
   Archive,
   Calendar,
@@ -33,7 +32,10 @@ import {
 import {
   DashboardMode,
   DEFAULT_LIVE_CONFIG,
+  evaluateSnapshotDataFreshness,
   executeLiveCommand,
+  FetchLike,
+  isCommandCapabilitySupported,
   LiveAdapterConfig,
   LivePollCoordinator,
   MissionControlDataController,
@@ -56,7 +58,7 @@ import {
   OperatorCommandRequest,
   PriorityLevel,
 } from './schema/contract';
-import { evaluateTimestamp, formatRelativeAge, formatUtcShort } from './utils/timeFormat';
+import { formatRelativeAge, formatUtcShort } from './utils/timeFormat';
 
 type NavSection =
   | 'board_overview'
@@ -76,7 +78,19 @@ interface ActionFeedbackBanner {
   undoTargetArchiveState?: boolean;
 }
 
-export default function App() {
+export interface AppProps {
+  initialMode?: DashboardMode;
+  initialLiveConfig?: LiveAdapterConfig;
+  liveFetchImpl?: FetchLike;
+  getNowIso?: () => string;
+}
+
+export default function App({
+  initialMode = 'demo',
+  initialLiveConfig = DEFAULT_LIVE_CONFIG,
+  liveFetchImpl,
+  getNowIso,
+}: AppProps) {
   // Demo controller is strictly isolated to Demo Mode
   const demoControllerRef = useRef<MissionControlDataController>(
     new MissionControlDataController()
@@ -85,9 +99,33 @@ export default function App() {
   // Live poll coordinator prevents overlapping requests and ignores late responses from old modes/endpoints
   const liveCoordinatorRef = useRef<LivePollCoordinator>(new LivePollCoordinator());
 
+  // Monotonic connection generation token shared by both live polls and live commands.
+  // Incremented on unmount, mode switch, or endpoint configuration update.
+  const connectionGenRef = useRef<number>(0);
+  const inFlightCommandsAbortRef = useRef<Set<AbortController>>(new Set());
+  const scheduledPollTimerRef = useRef<ReturnType<typeof globalThis.setTimeout> | null>(
+    null
+  );
+  const unmountedRef = useRef<boolean>(false);
+
+  const getNowFn = useCallback(
+    () => (getNowIso ? getNowIso() : new Date().toISOString()),
+    [getNowIso]
+  );
+  const getNowFnRef = useRef(getNowFn);
+  getNowFnRef.current = getNowFn;
+
+  const liveFetchImplRef = useRef<FetchLike | undefined>(liveFetchImpl);
+  liveFetchImplRef.current = liveFetchImpl;
+
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
-  const [mode, setMode] = useState<DashboardMode>('demo');
-  const [liveConfig, setLiveConfig] = useState<LiveAdapterConfig>(DEFAULT_LIVE_CONFIG);
+  const [mode, setMode] = useState<DashboardMode>(initialMode);
+  const modeRef = useRef<DashboardMode>(initialMode);
+  modeRef.current = mode;
+
+  const [liveConfig, setLiveConfig] = useState<LiveAdapterConfig>(initialLiveConfig);
+  const liveConfigRef = useRef<LiveAdapterConfig>(initialLiveConfig);
+  liveConfigRef.current = liveConfig;
 
   // Demo state
   const [demoSnapshot, setDemoSnapshot] = useState<MissionControlSnapshot>(() =>
@@ -102,13 +140,16 @@ export default function App() {
   const [liveConnectionHealth, setLiveConnectionHealth] =
     useState<ConnectionHealthState>('never_connected');
   const [liveWarningOrError, setLiveWarningOrError] = useState<string | null>(null);
-  const [liveLastSyncedAt, setLiveLastSyncedAt] = useState<string | null>(null);
+  // Transport contact timestamp is tracked strictly separately from snapshot.generatedAt
+  const [liveLastContactAt, setLiveLastContactAt] = useState<string | null>(null);
   const [consecutiveFailures, setConsecutiveFailures] = useState<number>(0);
+  const consecutiveFailuresRef = useRef<number>(0);
   const [isPollingLive, setIsPollingLive] = useState<boolean>(false);
   const [isBackgroundTab, setIsBackgroundTab] = useState<boolean>(false);
+  const isBackgroundTabRef = useRef<boolean>(false);
 
-  // Real advancing clock for Live Mode (updates every 1000ms so heartbeat expiry and stale warnings update without a new snapshot)
-  const [liveNowIso, setLiveNowIso] = useState<string>(() => new Date().toISOString());
+  // Real advancing clock for Live Mode (updates every 1000ms so heartbeat expiry and stale data warnings update without a new snapshot)
+  const [liveNowIso, setLiveNowIso] = useState<string>(() => getNowFn());
 
   // Navigation, layout & filter state
   const [activeNav, setActiveNav] = useState<NavSection>('board_overview');
@@ -136,12 +177,12 @@ export default function App() {
   // Advancing real-time clock in Live Mode with proper timer cleanup
   useEffect(() => {
     if (mode !== 'live') return;
-    setLiveNowIso(new Date().toISOString());
-    const intervalId = window.setInterval(() => {
-      setLiveNowIso(new Date().toISOString());
+    setLiveNowIso(getNowFnRef.current());
+    const intervalId = globalThis.setInterval(() => {
+      setLiveNowIso(getNowFnRef.current());
     }, 1000);
     return () => {
-      window.clearInterval(intervalId);
+      globalThis.clearInterval(intervalId);
     };
   }, [mode]);
 
@@ -157,99 +198,248 @@ export default function App() {
     return liveNowIso;
   }, [mode, demoClockOffsetSeconds, liveNowIso]);
 
+  const clearScheduledPollTimer = useCallback(() => {
+    if (scheduledPollTimerRef.current !== null) {
+      globalThis.clearTimeout(scheduledPollTimerRef.current);
+      scheduledPollTimerRef.current = null;
+    }
+  }, []);
+
+  const abortAllInFlightCommands = useCallback(() => {
+    for (const ctrl of inFlightCommandsAbortRef.current) {
+      ctrl.abort();
+    }
+    inFlightCommandsAbortRef.current.clear();
+  }, []);
+
+  // Forward reference for mutually recursive single-flight poll loop
+  const runLivePollCycleRef = useRef<
+    (cfg: LiveAdapterConfig, gen: number) => Promise<void>
+  >(async () => {});
+
+  const scheduleNextLivePoll = useCallback(
+    (gen: number, cfg: LiveAdapterConfig, failuresCount: number) => {
+      clearScheduledPollTimer();
+      if (
+        unmountedRef.current ||
+        modeRef.current !== 'live' ||
+        gen !== connectionGenRef.current
+      ) {
+        return;
+      }
+
+      const backoffMultiplier = Math.pow(1.5, Math.min(failuresCount, 5));
+      const tabMultiplier = isBackgroundTabRef.current ? cfg.backgroundTabMultiplier : 1;
+      const delayMs = Math.min(
+        cfg.maxBackoffMs * tabMultiplier,
+        Math.round(cfg.basePollIntervalMs * backoffMultiplier * tabMultiplier)
+      );
+
+      scheduledPollTimerRef.current = globalThis.setTimeout(() => {
+        scheduledPollTimerRef.current = null;
+        if (
+          !unmountedRef.current &&
+          modeRef.current === 'live' &&
+          gen === connectionGenRef.current
+        ) {
+          void runLivePollCycleRef.current(cfg, gen);
+        }
+      }, delayMs);
+    },
+    [clearScheduledPollTimer]
+  );
+
+  // Execute a single-flight poll cycle and always schedule the next cycle upon completion
+  const runLivePollCycle = useCallback(
+    async (cfg: LiveAdapterConfig, gen: number) => {
+      if (
+        unmountedRef.current ||
+        modeRef.current !== 'live' ||
+        gen !== connectionGenRef.current
+      ) {
+        return;
+      }
+      if (liveCoordinatorRef.current.isInFlight()) {
+        return;
+      }
+
+      clearScheduledPollTimer();
+      setIsPollingLive(true);
+      const nowForValidation = getNowFnRef.current();
+      setLiveNowIso(nowForValidation);
+
+      const outcome = await liveCoordinatorRef.current.pollOnce(cfg, {
+        referenceNowIso: nowForValidation,
+        fetchImpl: liveFetchImplRef.current,
+      });
+
+      if (
+        unmountedRef.current ||
+        modeRef.current !== 'live' ||
+        gen !== connectionGenRef.current
+      ) {
+        return;
+      }
+
+      setIsPollingLive(false);
+
+      if (
+        outcome.status === 'ignored_stale_generation' ||
+        outcome.status === 'skipped_in_flight'
+      ) {
+        return;
+      }
+
+      setLiveSnapshot(outcome.snapshot);
+      setLiveConnectionHealth(outcome.connectionHealth);
+      setLiveWarningOrError(outcome.warningOrError);
+      setLiveLastContactAt(outcome.lastSuccessfulContactAt);
+
+      let nextFailures = consecutiveFailuresRef.current;
+      if (outcome.status === 'updated') {
+        nextFailures = 0;
+        consecutiveFailuresRef.current = 0;
+        setConsecutiveFailures(0);
+      } else {
+        nextFailures = consecutiveFailuresRef.current + 1;
+        consecutiveFailuresRef.current = nextFailures;
+        setConsecutiveFailures(nextFailures);
+      }
+
+      // Schedule next attempt in continuous single-flight loop
+      scheduleNextLivePoll(gen, cfg, nextFailures);
+    },
+    [clearScheduledPollTimer, scheduleNextLivePoll]
+  );
+
+  runLivePollCycleRef.current = runLivePollCycle;
+
+  // Manual trigger using the active configuration and current connection generation
+  const performLivePoll = useCallback(async () => {
+    await runLivePollCycleRef.current(liveConfigRef.current, connectionGenRef.current);
+  }, []);
+
   // Track background tab visibility for bounded polling throttling
   useEffect(() => {
     const onVisibilityChange = () => {
-      setIsBackgroundTab(document.visibilityState === 'hidden');
+      const hidden = document.visibilityState === 'hidden';
+      isBackgroundTabRef.current = hidden;
+      setIsBackgroundTab(hidden);
+      if (
+        !unmountedRef.current &&
+        modeRef.current === 'live' &&
+        !liveCoordinatorRef.current.isInFlight()
+      ) {
+        scheduleNextLivePoll(
+          connectionGenRef.current,
+          liveConfigRef.current,
+          consecutiveFailuresRef.current
+        );
+      }
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
     return () => document.removeEventListener('visibilitychange', onVisibilityChange);
-  }, []);
+  }, [scheduleNextLivePoll]);
 
-  // Execute a bounded poll cycle via LivePollCoordinator
-  const performLivePoll = useCallback(async () => {
-    if (liveCoordinatorRef.current.isInFlight()) return;
-    setIsPollingLive(true);
-    const nowForValidation = new Date().toISOString();
-    const outcome = await liveCoordinatorRef.current.pollOnce(liveConfig, {
-      referenceNowIso: nowForValidation,
-    });
-    setIsPollingLive(false);
-
-    if (outcome.status === 'ignored_stale_generation' || outcome.status === 'skipped_in_flight') {
-      return;
-    }
-
-    setLiveSnapshot(outcome.snapshot);
-    setLiveConnectionHealth(outcome.connectionHealth);
-    setLiveWarningOrError(outcome.warningOrError);
-
-    if (outcome.status === 'updated') {
-      setLiveLastSyncedAt(new Date().toISOString());
-      setConsecutiveFailures(0);
-    } else {
-      setConsecutiveFailures((prev) => prev + 1);
-    }
-  }, [liveConfig]);
-
-  // Scheduled bounded polling in Live Mode with exponential backoff and background-tab throttling
+  // Start initial poll if mounted in Live Mode, and clean up all timers & in-flight requests on unmount
   useEffect(() => {
-    if (mode !== 'live') return;
-
-    const backoffMultiplier = Math.pow(1.5, Math.min(consecutiveFailures, 5));
-    const tabMultiplier = isBackgroundTab ? liveConfig.backgroundTabMultiplier : 1;
-    const delayMs = Math.min(
-      liveConfig.maxBackoffMs * tabMultiplier,
-      Math.round(liveConfig.basePollIntervalMs * backoffMultiplier * tabMultiplier)
-    );
-
-    const timerId = window.setTimeout(() => {
-      void performLivePoll();
-    }, delayMs);
-
+    unmountedRef.current = false;
+    if (modeRef.current === 'live') {
+      void runLivePollCycleRef.current(liveConfigRef.current, connectionGenRef.current);
+    }
     return () => {
-      window.clearTimeout(timerId);
+      unmountedRef.current = true;
+      connectionGenRef.current += 1;
+      clearScheduledPollTimer();
+      liveCoordinatorRef.current.invalidateAndReset(true);
+      abortAllInFlightCommands();
     };
-  }, [mode, consecutiveFailures, isBackgroundTab, liveConfig, performLivePoll]);
+  }, [clearScheduledPollTimer, abortAllInFlightCommands]);
 
-  // Switch between Demo and Live modes cleanly (clearing incompatible selections & cancelling in-flight polls)
+  // Complete endpoint/connection reset helper: clears endpoint-bound data, permissions, health, and feedback
+  const resetLiveEndpointStateAndInvalidate = useCallback((): number => {
+    connectionGenRef.current += 1;
+    const nextGen = connectionGenRef.current;
+    clearScheduledPollTimer();
+    liveCoordinatorRef.current.invalidateAndReset(true);
+    abortAllInFlightCommands();
+
+    setIsPollingLive(false);
+    setLiveSnapshot(null);
+    setLiveConnectionHealth('never_connected');
+    setLiveWarningOrError(null);
+    setLiveLastContactAt(null);
+    consecutiveFailuresRef.current = 0;
+    setConsecutiveFailures(0);
+    setSelectedProjectId(null);
+    setFeedbackBanner(null);
+
+    return nextGen;
+  }, [clearScheduledPollTimer, abortAllInFlightCommands]);
+
+  // Switch between Demo and Live modes cleanly (clearing incompatible selections & cancelling in-flight reads/writes)
   const handleSwitchMode = useCallback(
     (nextMode: DashboardMode) => {
-      liveCoordinatorRef.current.invalidateAndReset(true);
-      setIsPollingLive(false);
-      setSelectedProjectId(null);
-      setFeedbackBanner(null);
+      const nextGen = resetLiveEndpointStateAndInvalidate();
+      modeRef.current = nextMode;
+      setMode(nextMode);
 
       if (nextMode === 'live') {
-        setLiveSnapshot(null);
-        setLiveConnectionHealth('never_connected');
-        setLiveWarningOrError(null);
-        setLiveLastSyncedAt(null);
-        setConsecutiveFailures(0);
-        setLiveNowIso(new Date().toISOString());
-        setMode('live');
-        void performLivePoll();
-      } else {
-        setMode('demo');
+        setLiveNowIso(getNowFnRef.current());
+        void runLivePollCycleRef.current(liveConfigRef.current, nextGen);
       }
     },
-    [performLivePoll]
+    [resetLiveEndpointStateAndInvalidate]
   );
 
-  // Determine effective connection health, including dynamic stale-feed detection without a new snapshot
+  // Isolate endpoint/config changes completely: clear old snapshot, permissions, health, and feedback,
+  // invalidate pending reads & writes, and start polling with the NEW configuration.
+  const handleUpdateLiveConfig = useCallback(
+    (nextConfig: LiveAdapterConfig) => {
+      const nextGen = resetLiveEndpointStateAndInvalidate();
+      liveConfigRef.current = nextConfig;
+      setLiveConfig(nextConfig);
+
+      if (modeRef.current === 'live') {
+        setLiveNowIso(getNowFnRef.current());
+        void runLivePollCycleRef.current(nextConfig, nextGen);
+      }
+    },
+    [resetLiveEndpointStateAndInvalidate]
+  );
+
+  // Separate transport reachability (`liveLastContactAt`) from snapshot data freshness (`liveSnapshot.generatedAt`)
+  const liveDataFreshness = useMemo(() => {
+    if (mode !== 'live' || !liveSnapshot) return null;
+    return evaluateSnapshotDataFreshness(liveSnapshot, referenceNowIso, liveConfig);
+  }, [mode, liveSnapshot, referenceNowIso, liveConfig]);
+
+  // Determine effective connection health:
+  // Repeated HTTP 200 responses serving an old snapshot (`!liveDataFreshness.isDataFresh`) evaluate as `'stale'`!
   const effectiveConnectionHealth: ConnectionHealthState = useMemo(() => {
     if (mode === 'demo') return 'demo_synthetic';
-    if (liveConnectionHealth === 'connected' && liveLastSyncedAt) {
-      const syncAge = evaluateTimestamp(liveLastSyncedAt, referenceNowIso);
-      const staleLimitSec =
-        liveSnapshot?.evaluationThresholds.staleFeedWarningSeconds ??
-        Math.max(25, Math.ceil((liveConfig.basePollIntervalMs * 2.5) / 1000));
-      if (!syncAge.valid || (syncAge.ageSeconds !== null && syncAge.ageSeconds > staleLimitSec)) {
-        return 'stale';
-      }
+    if (!liveSnapshot || liveConnectionHealth === 'never_connected') {
+      return 'never_connected';
     }
-    return liveConnectionHealth;
-  }, [mode, liveConnectionHealth, liveLastSyncedAt, referenceNowIso, liveSnapshot, liveConfig]);
+    if (liveConnectionHealth === 'disconnected') {
+      return 'disconnected';
+    }
+    if (liveConnectionHealth === 'stale') {
+      return 'stale';
+    }
+    if (liveDataFreshness && !liveDataFreshness.isDataFresh) {
+      return 'stale';
+    }
+    return 'connected';
+  }, [mode, liveConnectionHealth, liveSnapshot, liveDataFreshness]);
+
+  const effectiveLiveWarning = useMemo(() => {
+    if (liveWarningOrError) return liveWarningOrError;
+    if (liveDataFreshness && !liveDataFreshness.isDataFresh) {
+      return liveDataFreshness.reason;
+    }
+    return null;
+  }, [liveWarningOrError, liveDataFreshness]);
 
   const activeSnapshot: MissionControlSnapshot | null =
     mode === 'demo' ? demoSnapshot : liveSnapshot;
@@ -372,7 +562,8 @@ export default function App() {
   }, [filteredProjects]);
 
   // Effective capabilities:
-  // In Live Mode, controls are strictly read-only unless `liveConfig.enableLiveCommandRoute` AND `activeSnapshot.capabilities.commandEndpointVerified` are true
+  // In Live Mode, controls are strictly read-only unless `effectiveConnectionHealth === 'connected'`,
+  // `liveConfig.enableLiveCommandRoute === true`, AND `activeSnapshot.capabilities.commandEndpointVerified === true`.
   const effectiveCapabilities: BackendCapabilities = useMemo(() => {
     if (!activeSnapshot) {
       return {
@@ -394,7 +585,7 @@ export default function App() {
           canSendReminder: false,
           canResolveDecision: false,
           reasonIfDisabled:
-            'Live feed is stale or disconnected. Reconnect before issuing operator commands.',
+            'Live feed is stale or disconnected. Reconnect to fresh data before issuing operator commands.',
         };
       }
       if (
@@ -417,8 +608,8 @@ export default function App() {
   }, [activeSnapshot, mode, effectiveConnectionHealth, liveConfig.enableLiveCommandRoute]);
 
   // Unified Command Dispatcher:
-  // - In Demo Mode: invokes `demoControllerRef.current.executeCommand` and updates `demoSnapshot`
-  // - In Live Mode: NEVER invokes `demoControllerRef` or mutates `demoSnapshot`; calls `executeLiveCommand`
+  // - Rechecks specific capability and connection health at dispatch time
+  // - Cancels & ignores command responses from obsolete connections or modes
   const dispatchOperatorCommand = useCallback(
     async (
       req: OperatorCommandRequest,
@@ -428,29 +619,101 @@ export default function App() {
         undoTargetArchiveState?: boolean;
       }
     ) => {
-      if (mode === 'live') {
-        const liveRes = await executeLiveCommand(
-          liveConfig,
-          activeSnapshot?.capabilities ?? null,
-          req
-        );
-        if (liveRes.ok) {
+      if (modeRef.current === 'live') {
+        const dispatchGen = connectionGenRef.current;
+        const dispatchCfg = liveConfigRef.current;
+        const rawSnapshotCaps = liveSnapshot?.capabilities ?? null;
+
+        // Recheck current connection health & specific capability at dispatch
+        if (effectiveConnectionHealth !== 'connected') {
           setFeedbackBanner({
-            id: liveRes.idempotencyKey,
-            tone: 'success',
-            message:
-              liveRes.deliveryAck?.outcome === 'accepted_pending_delivery'
-                ? 'Command accepted by backend; downstream delivery is still pending.'
-                : 'Live command acknowledged by backend. Refreshing snapshot...',
+            id: req.idempotencyKey,
+            tone: 'danger',
+            message: `Cannot dispatch "${req.command.type}" while live connection is "${effectiveConnectionHealth}".`,
           });
-          void performLivePoll();
+          return;
+        }
+
+        if (
+          !dispatchCfg.enableLiveCommandRoute ||
+          !rawSnapshotCaps?.commandEndpointVerified
+        ) {
+          setFeedbackBanner({
+            id: req.idempotencyKey,
+            tone: 'danger',
+            message:
+              'Live mode is read-only until a verified backend command route (/commands) is configured and advertised.',
+          });
+          return;
+        }
+
+        if (!isCommandCapabilitySupported(req.command.type, rawSnapshotCaps)) {
+          setFeedbackBanner({
+            id: req.idempotencyKey,
+            tone: 'danger',
+            message:
+              rawSnapshotCaps.reasonIfDisabled ||
+              `Backend does not permit "${req.command.type}" on this connection.`,
+          });
+          return;
+        }
+
+        const cmdAbort = new AbortController();
+        inFlightCommandsAbortRef.current.add(cmdAbort);
+
+        const liveRes = await executeLiveCommand(
+          dispatchCfg,
+          rawSnapshotCaps,
+          req,
+          {
+            connectionHealth: effectiveConnectionHealth,
+            signal: cmdAbort.signal,
+            fetchImpl: liveFetchImplRef.current,
+          }
+        );
+
+        inFlightCommandsAbortRef.current.delete(cmdAbort);
+
+        // Ignore responses from obsolete connections or modes
+        if (
+          unmountedRef.current ||
+          modeRef.current !== 'live' ||
+          dispatchGen !== connectionGenRef.current ||
+          cmdAbort.signal.aborted
+        ) {
+          return;
+        }
+
+        if (liveRes.ok) {
+          if (liveRes.deliveryAck?.outcome === 'accepted_pending_delivery') {
+            setFeedbackBanner({
+              id: liveRes.idempotencyKey,
+              tone: 'warning',
+              message: `Command accepted by backend; downstream delivery to ${liveRes.deliveryAck.recipient} is still pending acknowledgment.`,
+            });
+          } else if (liveRes.deliveryAck?.outcome === 'delivered_acknowledged') {
+            setFeedbackBanner({
+              id: liveRes.idempotencyKey,
+              tone: 'success',
+              message: `Live reminder delivered and acknowledged by ${liveRes.deliveryAck.recipient} via ${liveRes.deliveryAck.channel} (Ack: ${liveRes.deliveryAck.ackId}).`,
+            });
+          } else {
+            setFeedbackBanner({
+              id: liveRes.idempotencyKey,
+              tone: 'success',
+              message: `Live command (${req.command.type}) acknowledged by backend${
+                liveRes.newRevision ? ` (rev v${liveRes.newRevision})` : ''
+              }. Refreshing snapshot...`,
+            });
+          }
+          void runLivePollCycleRef.current(dispatchCfg, dispatchGen);
         } else {
           setFeedbackBanner({
             id: liveRes.idempotencyKey,
             tone: liveRes.errorCode === 'UNCERTAIN_WRITE_TIMEOUT' ? 'warning' : 'danger',
             message:
               liveRes.errorMessage ||
-              'Live command rejected. Demo controller was not invoked.',
+              'Live command rejected by backend. Demo controller was not invoked.',
           });
         }
         return;
@@ -494,7 +757,7 @@ export default function App() {
         });
       }
     },
-    [mode, liveConfig, activeSnapshot, performLivePoll]
+    [liveSnapshot, effectiveConnectionHealth]
   );
 
   const handleToggleArchive = (projectId: string, archive: boolean) => {
@@ -810,11 +1073,16 @@ export default function App() {
                   ·
                 </span>
                 <span>
-                  Last valid sync:{' '}
+                  Snapshot generated:{' '}
                   <strong className="font-mono tabular-nums">
-                    {formatRelativeAge(liveLastSyncedAt, referenceNowIso)}
+                    {formatRelativeAge(liveSnapshot?.generatedAt, referenceNowIso)}
                   </strong>
-                  {liveWarningOrError ? ` (${liveWarningOrError})` : ''}.
+                  {' · '}
+                  Last HTTP contact:{' '}
+                  <strong className="font-mono tabular-nums">
+                    {formatRelativeAge(liveLastContactAt, referenceNowIso)}
+                  </strong>
+                  {effectiveLiveWarning ? ` (${effectiveLiveWarning})` : ''}.
                 </span>
               </div>
               <button
@@ -842,7 +1110,9 @@ export default function App() {
                 dot · Projects Board
               </div>
               <div className="text-[11px] font-mono text-slate-500 dark:text-slate-400 mt-0.5">
-                {mode === 'demo' ? 'Mode: Demo Fixtures' : `Mode: Live (${effectiveConnectionHealth})`}
+                {mode === 'demo'
+                  ? 'Mode: Demo Fixtures'
+                  : `Mode: Live (${effectiveConnectionHealth})`}
               </div>
             </div>
 
@@ -853,12 +1123,37 @@ export default function App() {
               </div>
               {(
                 [
-                  { id: 'board_overview', label: 'Board Overview', icon: List, badge: activeUnarchivedProjects.length },
+                  {
+                    id: 'board_overview',
+                    label: 'Board Overview',
+                    icon: List,
+                    badge: activeUnarchivedProjects.length,
+                  },
                   { id: 'today_focus', label: 'Today Focus', icon: Calendar, badge: undefined },
-                  { id: 'attention_queue', label: 'Attention Needed', icon: ShieldAlert, badge: openDecisionsCount },
-                  { id: 'workers_runs', label: 'Workers & Runs', icon: Cpu, badge: activeSnapshot?.workers.length },
-                  { id: 'archived', label: 'Archived', icon: Archive, badge: archivedProjects.length },
-                  { id: 'contract_tests', label: 'Contract & Tests', icon: FileCode2, badge: undefined },
+                  {
+                    id: 'attention_queue',
+                    label: 'Attention Needed',
+                    icon: ShieldAlert,
+                    badge: openDecisionsCount,
+                  },
+                  {
+                    id: 'workers_runs',
+                    label: 'Workers & Runs',
+                    icon: Cpu,
+                    badge: activeSnapshot?.workers.length,
+                  },
+                  {
+                    id: 'archived',
+                    label: 'Archived',
+                    icon: Archive,
+                    badge: archivedProjects.length,
+                  },
+                  {
+                    id: 'contract_tests',
+                    label: 'Contract & Tests',
+                    icon: FileCode2,
+                    badge: undefined,
+                  },
                 ] as const
               ).map((item) => {
                 const Icon = item.icon;
@@ -907,7 +1202,11 @@ export default function App() {
                     ['waiting_for_me', 'Needs Me', bucketCounts.waiting_for_me],
                     ['blocked', 'Blocked', bucketCounts.blocked],
                     ['unfinished', 'Unfinished', bucketCounts.unfinished],
-                    ['recently_verified_complete', 'Completed', bucketCounts.recently_verified_complete],
+                    [
+                      'recently_verified_complete',
+                      'Completed',
+                      bucketCounts.recently_verified_complete,
+                    ],
                   ] as const
                 ).map(([bKey, bLabel, bCount]) => {
                   const isSelected =
@@ -948,7 +1247,12 @@ export default function App() {
               ) : effectiveConnectionHealth === 'connected' ? (
                 <>
                   <Wifi className="w-3.5 h-3.5 text-teal-500 shrink-0" />
-                  <span>Connected</span>
+                  <span>Connected (Fresh)</span>
+                </>
+              ) : effectiveConnectionHealth === 'stale' ? (
+                <>
+                  <AlertTriangle className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                  <span>Stale Snapshot</span>
                 </>
               ) : (
                 <>
@@ -1023,7 +1327,7 @@ export default function App() {
           {/* Top Header */}
           <header className="bg-white dark:bg-[#111827] border-b border-slate-200 dark:border-slate-800 px-4 sm:px-6 py-3">
             <div className="flex flex-wrap items-center justify-between gap-3">
-              {/* Left: Mobile Menu Trigger + View Title + Connection Status & Last Update */}
+              {/* Left: Mobile Menu Trigger + View Title + Separate Snapshot Observation vs Contact Status */}
               <div className="flex items-center gap-3 min-w-0">
                 <button
                   type="button"
@@ -1058,9 +1362,12 @@ export default function App() {
                             activeSnapshot?.generatedAt,
                             referenceNowIso
                           )})`
-                        : liveLastSyncedAt
-                        ? `Last live update: ${formatRelativeAge(
-                            liveLastSyncedAt,
+                        : activeSnapshot
+                        ? `Snapshot observed: ${formatRelativeAge(
+                            activeSnapshot.generatedAt,
+                            referenceNowIso
+                          )} · HTTP contact: ${formatRelativeAge(
+                            liveLastContactAt,
                             referenceNowIso
                           )}`
                         : 'Live: Never connected'}
@@ -1218,9 +1525,9 @@ export default function App() {
                   </code>
                   . Synthetic demo fixtures are never displayed in Live Mode.
                 </p>
-                {liveWarningOrError && (
+                {effectiveLiveWarning && (
                   <div className="bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/60 rounded p-3 text-xs font-mono text-red-800 dark:text-red-300 mb-5 text-left">
-                    {liveWarningOrError} (Failed attempts: {consecutiveFailures})
+                    {effectiveLiveWarning} (Failed attempts: {consecutiveFailures})
                   </div>
                 )}
                 <div className="flex flex-wrap items-center justify-center gap-2.5">
@@ -1497,7 +1804,7 @@ export default function App() {
                       </div>
 
                       {diagnosticsExpanded && (
-                        <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-800 grid grid-cols-1 sm:grid-cols-4 gap-3 text-xs font-mono text-slate-600 dark:text-slate-400">
+                        <div className="mt-3 pt-3 border-t border-slate-200 dark:border-slate-800 grid grid-cols-1 sm:grid-cols-5 gap-3 text-xs font-mono text-slate-600 dark:text-slate-400">
                           <div>
                             <div className="text-[11px] text-slate-400">Heartbeat Expiry</div>
                             <div>
@@ -1517,14 +1824,30 @@ export default function App() {
                             </div>
                           </div>
                           <div>
-                            <div className="text-[11px] text-slate-400">Evaluation Clock</div>
-                            <div>{formatUtcShort(referenceNowIso)}</div>
+                            <div className="text-[11px] text-slate-400">
+                              Snapshot Generated At
+                            </div>
+                            <div>{formatUtcShort(activeSnapshot.generatedAt)}</div>
+                          </div>
+                          <div>
+                            <div className="text-[11px] text-slate-400">
+                              Last HTTP Contact
+                            </div>
+                            <div>
+                              {mode === 'demo'
+                                ? 'N/A (Demo)'
+                                : liveLastContactAt
+                                ? formatUtcShort(liveLastContactAt)
+                                : 'None'}
+                            </div>
                           </div>
                           <div>
                             <div className="text-[11px] text-slate-400">Command Capabilities</div>
                             <div>
                               {effectiveCapabilities.canChangePriority
-                                ? 'Writable (Demo)'
+                                ? mode === 'demo'
+                                  ? 'Writable (Demo)'
+                                  : 'Writable (Live)'
                                 : 'Read-Only'}
                             </div>
                           </div>
@@ -1575,15 +1898,9 @@ export default function App() {
           demoClockOffsetSeconds={demoClockOffsetSeconds}
           onClose={() => setAdapterModalOpen(false)}
           onSwitchMode={handleSwitchMode}
-          onUpdateLiveConfig={(cfg) => {
-            liveCoordinatorRef.current.invalidateAndReset(false);
-            setLiveConfig(cfg);
-            if (mode === 'live') {
-              void performLivePoll();
-            }
-          }}
+          onUpdateLiveConfig={handleUpdateLiveConfig}
           onTriggerLivePollNow={() => {
-            if (mode !== 'live') {
+            if (modeRef.current !== 'live') {
               handleSwitchMode('live');
             } else {
               void performLivePoll();

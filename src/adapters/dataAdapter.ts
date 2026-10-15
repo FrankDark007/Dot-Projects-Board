@@ -9,14 +9,19 @@
  * 3. Malformed or out-of-order responses are rejected while preserving the last valid snapshot with a warning.
  * 4. Overlapping polls are prevented, requests use bounded AbortSignal timeouts, and late responses
  *    from previous endpoints or modes are deterministically ignored.
- * 5. Live commands are disabled (read-only) until a verified backend command endpoint is present,
- *    never retry uncertain timeouts blindly, and distinguish command acceptance from delivery acknowledgment.
+ * 5. Transport contact health (`lastSuccessfulContactAt`) is tracked separately from snapshot data
+ *    freshness (`snapshot.generatedAt`). Repeated HTTP 200 responses serving an old snapshot
+ *    never make stale data appear fresh.
+ * 6. Live commands recheck connection health and specific backend capability at dispatch, validate
+ *    HTTP status, response shape, exact idempotencyKey, and deliveryAck semantics, and never auto-retry timeouts.
  */
 
 import { deduplicateSnapshot } from '../engine/stateEvaluator';
 import { createSyntheticSnapshot, REFERENCE_NOW_ISO } from '../fixtures/syntheticFixtures';
 import {
   ActivityEvent,
+  BackendCapabilities,
+  CommandPayload,
   ConnectionHealthState,
   CONTRACT_SCHEMA_VERSION,
   MissionControlSnapshot,
@@ -24,7 +29,11 @@ import {
   OperatorCommandResponse,
   ReminderReceipt,
 } from '../schema/contract';
-import { validateSnapshotPayload } from '../schema/validator';
+import {
+  validateCommandResponsePayload,
+  validateSnapshotPayload,
+} from '../schema/validator';
+import { evaluateTimestamp } from '../utils/timeFormat';
 
 export type DashboardMode = 'demo' | 'live';
 
@@ -61,6 +70,30 @@ export class SnapshotValidationError extends Error {
 }
 
 export type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+/**
+ * Checks whether a specific command type is permitted by `BackendCapabilities`.
+ */
+export function isCommandCapabilitySupported(
+  commandType: CommandPayload['type'],
+  capabilities: BackendCapabilities | null | undefined
+): boolean {
+  if (!capabilities) return false;
+  switch (commandType) {
+    case 'archive_project':
+      return capabilities.canArchive === true;
+    case 'set_priority':
+      return capabilities.canChangePriority === true;
+    case 'add_note':
+      return capabilities.canAddNote === true;
+    case 'send_reminder':
+      return capabilities.canSendReminder === true;
+    case 'resolve_decision':
+      return capabilities.canResolveDecision === true;
+    default:
+      return false;
+  }
+}
 
 /**
  * Stateful in-memory controller strictly for DEMO MODE synthetic fixtures and fixture unit tests.
@@ -150,39 +183,11 @@ export class MissionControlDataController {
 
     // Capability check
     const caps = this.snapshot.capabilities;
-    if (command.type === 'archive_project' && !caps.canArchive) {
+    if (!isCommandCapabilitySupported(command.type, caps)) {
       return this.recordError(
         req.idempotencyKey,
         'CAPABILITY_UNSUPPORTED',
-        caps.reasonIfDisabled ?? 'Archive capability is disabled.'
-      );
-    }
-    if (command.type === 'set_priority' && !caps.canChangePriority) {
-      return this.recordError(
-        req.idempotencyKey,
-        'CAPABILITY_UNSUPPORTED',
-        caps.reasonIfDisabled ?? 'Priority mutation is disabled.'
-      );
-    }
-    if (command.type === 'add_note' && !caps.canAddNote) {
-      return this.recordError(
-        req.idempotencyKey,
-        'CAPABILITY_UNSUPPORTED',
-        caps.reasonIfDisabled ?? 'Operator notes are disabled.'
-      );
-    }
-    if (command.type === 'send_reminder' && !caps.canSendReminder) {
-      return this.recordError(
-        req.idempotencyKey,
-        'CAPABILITY_UNSUPPORTED',
-        caps.reasonIfDisabled ?? 'Owner reminders are disabled.'
-      );
-    }
-    if (command.type === 'resolve_decision' && !caps.canResolveDecision) {
-      return this.recordError(
-        req.idempotencyKey,
-        'CAPABILITY_UNSUPPORTED',
-        caps.reasonIfDisabled ?? 'Decision resolution is disabled.'
+        caps.reasonIfDisabled ?? `Capability for ${command.type} is disabled.`
       );
     }
 
@@ -229,6 +234,8 @@ export class MissionControlDataController {
       const res: OperatorCommandResponse = {
         ok: true,
         idempotencyKey: req.idempotencyKey,
+        commandType: command.type,
+        projectId: project.projectId,
         commandAccepted: true,
         newRevision: nextRevision,
         acknowledgedAt: nowIso,
@@ -263,6 +270,8 @@ export class MissionControlDataController {
       const res: OperatorCommandResponse = {
         ok: true,
         idempotencyKey: req.idempotencyKey,
+        commandType: command.type,
+        projectId: project.projectId,
         commandAccepted: true,
         newRevision: nextRevision,
         acknowledgedAt: nowIso,
@@ -311,6 +320,8 @@ export class MissionControlDataController {
       const res: OperatorCommandResponse = {
         ok: true,
         idempotencyKey: req.idempotencyKey,
+        commandType: command.type,
+        projectId: project.projectId,
         commandAccepted: true,
         newRevision: nextRevision,
         acknowledgedAt: nowIso,
@@ -360,6 +371,8 @@ export class MissionControlDataController {
         const failRes: OperatorCommandResponse = {
           ok: false,
           idempotencyKey: req.idempotencyKey,
+          commandType: command.type,
+          projectId: project.projectId,
           commandAccepted: true,
           newRevision: nextRevision,
           deliveryAck: {
@@ -413,6 +426,8 @@ export class MissionControlDataController {
         const pendingRes: OperatorCommandResponse = {
           ok: true,
           idempotencyKey: req.idempotencyKey,
+          commandType: command.type,
+          projectId: project.projectId,
           commandAccepted: true,
           newRevision: nextRevision,
           acknowledgedAt: nowIso,
@@ -432,6 +447,8 @@ export class MissionControlDataController {
         const timeoutRes: OperatorCommandResponse = {
           ok: false,
           idempotencyKey: req.idempotencyKey,
+          commandType: command.type,
+          projectId: project.projectId,
           commandAccepted: false,
           deliveryAck: {
             acknowledged: false,
@@ -439,7 +456,8 @@ export class MissionControlDataController {
             ackId: null,
             channel: 'synthetic-demo-notifier',
             recipient: command.targetOwner,
-            error: 'Write request timed out before response; outcome is uncertain. Do not blindly retry without refreshing snapshot.',
+            error:
+              'Write request timed out before response; outcome is uncertain. Do not blindly retry without refreshing snapshot.',
           },
           errorCode: 'UNCERTAIN_WRITE_TIMEOUT',
           errorMessage:
@@ -485,6 +503,8 @@ export class MissionControlDataController {
       const okRes: OperatorCommandResponse = {
         ok: true,
         idempotencyKey: req.idempotencyKey,
+        commandType: command.type,
+        projectId: project.projectId,
         commandAccepted: true,
         newRevision: nextRevision,
         acknowledgedAt: nowIso,
@@ -556,6 +576,8 @@ export class MissionControlDataController {
       const res: OperatorCommandResponse = {
         ok: true,
         idempotencyKey: req.idempotencyKey,
+        commandType: command.type,
+        projectId: project.projectId,
         commandAccepted: true,
         newRevision: nextRevision,
         acknowledgedAt: nowIso,
@@ -681,19 +703,37 @@ export async function fetchLiveSnapshot(
  * Executes a Live Command against the configured local Mission Control backend.
  * CRITICAL RULES:
  * 1. Never invokes or falls back to `MissionControlDataController` (demo state).
- * 2. Refuses execution with `LIVE_COMMANDS_UNCONFIGURED` unless `config.enableLiveCommandRoute`
+ * 2. Rechecks current connection health (`options.connectionHealth === 'connected'`) at dispatch.
+ * 3. Refuses execution with `LIVE_COMMANDS_UNCONFIGURED` unless `config.enableLiveCommandRoute`
  *    and `capabilities.commandEndpointVerified` are both true.
- * 3. Uses bounded timeout and NEVER blindly retries an uncertain timeout.
+ * 4. Rechecks the specific command capability (`canArchive`, `canChangePriority`, etc.) at dispatch.
+ * 5. Validates HTTP status, response shape, exact matching `idempotencyKey`, command identity,
+ *    and `deliveryAck` outcome semantics via `validateCommandResponsePayload`.
+ * 6. Uses bounded timeout and NEVER blindly retries an uncertain timeout.
  */
 export async function executeLiveCommand(
   config: LiveAdapterConfig,
   capabilities: MissionControlSnapshot['capabilities'] | null,
   req: OperatorCommandRequest,
   options?: {
+    connectionHealth?: ConnectionHealthState;
     signal?: AbortSignal;
     fetchImpl?: FetchLike;
   }
 ): Promise<OperatorCommandResponse> {
+  if (
+    options?.connectionHealth !== undefined &&
+    options.connectionHealth !== 'connected'
+  ) {
+    return {
+      ok: false,
+      idempotencyKey: req.idempotencyKey,
+      commandAccepted: false,
+      errorCode: 'NOT_CONNECTED',
+      errorMessage: `Cannot dispatch live command while connection state is "${options.connectionHealth}". Reconnect to a fresh live feed first.`,
+    };
+  }
+
   if (!config.enableLiveCommandRoute || !capabilities?.commandEndpointVerified) {
     return {
       ok: false,
@@ -705,17 +745,49 @@ export async function executeLiveCommand(
     };
   }
 
+  if (!isCommandCapabilitySupported(req.command.type, capabilities)) {
+    return {
+      ok: false,
+      idempotencyKey: req.idempotencyKey,
+      commandAccepted: false,
+      errorCode: 'CAPABILITY_UNSUPPORTED',
+      errorMessage:
+        capabilities.reasonIfDisabled ||
+        `Backend capability for "${req.command.type}" is disabled.`,
+    };
+  }
+
   const fetchFn: FetchLike = options?.fetchImpl ?? ((input, init) => fetch(input, init));
   const url = `${config.endpointBaseUrl.replace(/\/$/, '')}/commands`;
 
   const timeoutController = new AbortController();
   const timeoutMs = config.requestTimeoutMs > 0 ? config.requestTimeoutMs : 8000;
   let timedOut = false;
+  let callerAborted = false;
 
   const timer = globalThis.setTimeout(() => {
     timedOut = true;
     timeoutController.abort();
   }, timeoutMs);
+
+  const onCallerAbort = () => {
+    callerAborted = true;
+    timeoutController.abort();
+  };
+
+  if (options?.signal) {
+    if (options.signal.aborted) {
+      globalThis.clearTimeout(timer);
+      return {
+        ok: false,
+        idempotencyKey: req.idempotencyKey,
+        commandAccepted: false,
+        errorCode: 'NOT_CONNECTED',
+        errorMessage: 'Command aborted because connection or mode changed before dispatch.',
+      };
+    }
+    options.signal.addEventListener('abort', onCallerAbort, { once: true });
+  }
 
   try {
     const response = await fetchFn(url, {
@@ -731,18 +803,46 @@ export async function executeLiveCommand(
       signal: timeoutController.signal,
     });
 
-    const data = (await response.json()) as OperatorCommandResponse;
-    if (!data || typeof data.ok !== 'boolean' || typeof data.idempotencyKey !== 'string') {
+    if (callerAborted) {
+      return {
+        ok: false,
+        idempotencyKey: req.idempotencyKey,
+        commandAccepted: false,
+        errorCode: 'NOT_CONNECTED',
+        errorMessage: 'Command response ignored because connection or mode changed.',
+      };
+    }
+
+    let parsedBody: unknown = null;
+    try {
+      parsedBody = await response.json();
+    } catch {
       return {
         ok: false,
         idempotencyKey: req.idempotencyKey,
         commandAccepted: false,
         errorCode: 'VALIDATION_ERROR',
-        errorMessage: 'Malformed command response from live backend.',
+        errorMessage: `Non-JSON command response from live backend (HTTP ${response.status}).`,
       };
     }
-    return data;
+
+    return validateCommandResponsePayload(
+      parsedBody,
+      req,
+      response.status,
+      response.ok
+    );
   } catch (err) {
+    if (callerAborted) {
+      return {
+        ok: false,
+        idempotencyKey: req.idempotencyKey,
+        commandAccepted: false,
+        errorCode: 'NOT_CONNECTED',
+        errorMessage: 'Command aborted due to endpoint or mode change.',
+      };
+    }
+
     if (timedOut) {
       return {
         ok: false,
@@ -774,6 +874,9 @@ export async function executeLiveCommand(
     };
   } finally {
     globalThis.clearTimeout(timer);
+    if (options?.signal) {
+      options.signal.removeEventListener('abort', onCallerAbort);
+    }
   }
 }
 
@@ -786,19 +889,68 @@ export interface PollCycleOutcome {
     | 'skipped_in_flight';
   connectionHealth: ConnectionHealthState;
   snapshot: MissionControlSnapshot | null;
+  lastSuccessfulContactAt: string | null;
+  snapshotGeneratedAt: string | null;
   warningOrError: string | null;
 }
 
 /**
+ * Evaluates whether a snapshot's own generation timestamp (`snapshot.generatedAt`) is fresh
+ * relative to `referenceNowIso` and the configured `staleFeedWarningSeconds`.
+ * Repeated HTTP 200 responses returning an old `generatedAt` will evaluate as stale!
+ */
+export function evaluateSnapshotDataFreshness(
+  snapshot: MissionControlSnapshot,
+  referenceNowIso: string,
+  config: LiveAdapterConfig
+): {
+  isDataFresh: boolean;
+  ageSeconds: number | null;
+  staleLimitSeconds: number;
+  reason: string | null;
+} {
+  const staleLimitSeconds =
+    snapshot.evaluationThresholds.staleFeedWarningSeconds ??
+    Math.max(25, Math.ceil((config.basePollIntervalMs * 2.5) / 1000));
+
+  const genEval = evaluateTimestamp(snapshot.generatedAt, referenceNowIso);
+  if (!genEval.valid || genEval.ageSeconds === null) {
+    return {
+      isDataFresh: false,
+      ageSeconds: null,
+      staleLimitSeconds,
+      reason: `Snapshot generatedAt timestamp is invalid or in the future (${genEval.reason || 'invalid'}).`,
+    };
+  }
+
+  if (genEval.ageSeconds > staleLimitSeconds) {
+    return {
+      isDataFresh: false,
+      ageSeconds: genEval.ageSeconds,
+      staleLimitSeconds,
+      reason: `Transport reachable, but snapshot data is stale (generated ${genEval.ageSeconds}s ago > ${staleLimitSeconds}s freshness threshold).`,
+    };
+  }
+
+  return {
+    isDataFresh: true,
+    ageSeconds: genEval.ageSeconds,
+    staleLimitSeconds,
+    reason: null,
+  };
+}
+
+/**
  * Stateful coordinator for Live Mode polling that prevents overlapping polls,
- * cancels in-flight requests on endpoint/mode switch, and ignores late responses
- * from old generations.
+ * cancels in-flight requests on endpoint/mode switch, ignores late responses
+ * from old generations, and separates transport contact time from snapshot data freshness.
  */
 export class LivePollCoordinator {
   private generationId = 0;
   private inFlightAbort: AbortController | null = null;
   private isPolling = false;
   private lastValidSnapshot: MissionControlSnapshot | null = null;
+  private lastSuccessfulContactAt: string | null = null;
   private connectionHealth: ConnectionHealthState = 'never_connected';
   private lastErrorOrWarning: string | null = null;
 
@@ -812,6 +964,10 @@ export class LivePollCoordinator {
 
   public getLastValidSnapshot(): MissionControlSnapshot | null {
     return this.lastValidSnapshot;
+  }
+
+  public getLastSuccessfulContactAt(): string | null {
+    return this.lastSuccessfulContactAt;
   }
 
   public getConnectionHealth(): ConnectionHealthState {
@@ -830,6 +986,7 @@ export class LivePollCoordinator {
     this.isPolling = false;
     if (clearLastSnapshot) {
       this.lastValidSnapshot = null;
+      this.lastSuccessfulContactAt = null;
       this.connectionHealth = 'never_connected';
       this.lastErrorOrWarning = null;
     }
@@ -847,6 +1004,8 @@ export class LivePollCoordinator {
         status: 'skipped_in_flight',
         connectionHealth: this.connectionHealth,
         snapshot: this.lastValidSnapshot,
+        lastSuccessfulContactAt: this.lastSuccessfulContactAt,
+        snapshotGeneratedAt: this.lastValidSnapshot?.generatedAt ?? null,
         warningOrError: this.lastErrorOrWarning,
       };
     }
@@ -855,11 +1014,12 @@ export class LivePollCoordinator {
     const abortCtrl = new AbortController();
     this.inFlightAbort = abortCtrl;
     this.isPolling = true;
+    const contactIso = options?.referenceNowIso ?? new Date().toISOString();
 
     try {
       const nextSnap = await fetchLiveSnapshot(config, {
         signal: abortCtrl.signal,
-        referenceNowIso: options?.referenceNowIso,
+        referenceNowIso: contactIso,
         previousValidSnapshot: this.lastValidSnapshot,
         fetchImpl: options?.fetchImpl,
       });
@@ -870,19 +1030,32 @@ export class LivePollCoordinator {
           status: 'ignored_stale_generation',
           connectionHealth: this.connectionHealth,
           snapshot: this.lastValidSnapshot,
+          lastSuccessfulContactAt: this.lastSuccessfulContactAt,
+          snapshotGeneratedAt: this.lastValidSnapshot?.generatedAt ?? null,
           warningOrError: null,
         };
       }
 
       this.lastValidSnapshot = nextSnap;
-      this.connectionHealth = 'connected';
-      this.lastErrorOrWarning = null;
+      this.lastSuccessfulContactAt = contactIso;
+
+      // Separate HTTP transport success from snapshot data freshness!
+      const freshness = evaluateSnapshotDataFreshness(nextSnap, contactIso, config);
+      if (!freshness.isDataFresh) {
+        this.connectionHealth = 'stale';
+        this.lastErrorOrWarning = freshness.reason;
+      } else {
+        this.connectionHealth = 'connected';
+        this.lastErrorOrWarning = null;
+      }
 
       return {
         status: 'updated',
-        connectionHealth: 'connected',
+        connectionHealth: this.connectionHealth,
         snapshot: nextSnap,
-        warningOrError: null,
+        lastSuccessfulContactAt: this.lastSuccessfulContactAt,
+        snapshotGeneratedAt: nextSnap.generatedAt,
+        warningOrError: this.lastErrorOrWarning,
       };
     } catch (err) {
       if (myGeneration !== this.generationId) {
@@ -890,6 +1063,8 @@ export class LivePollCoordinator {
           status: 'ignored_stale_generation',
           connectionHealth: this.connectionHealth,
           snapshot: this.lastValidSnapshot,
+          lastSuccessfulContactAt: this.lastSuccessfulContactAt,
+          snapshotGeneratedAt: this.lastValidSnapshot?.generatedAt ?? null,
           warningOrError: null,
         };
       }
@@ -904,6 +1079,8 @@ export class LivePollCoordinator {
           status: 'rejected_validation_preserved_last',
           connectionHealth: this.connectionHealth,
           snapshot: this.lastValidSnapshot,
+          lastSuccessfulContactAt: this.lastSuccessfulContactAt,
+          snapshotGeneratedAt: this.lastValidSnapshot?.generatedAt ?? null,
           warningOrError: msg,
         };
       }
@@ -913,6 +1090,8 @@ export class LivePollCoordinator {
         status: 'network_error',
         connectionHealth: this.connectionHealth,
         snapshot: this.lastValidSnapshot,
+        lastSuccessfulContactAt: this.lastSuccessfulContactAt,
+        snapshotGeneratedAt: this.lastValidSnapshot?.generatedAt ?? null,
         warningOrError: msg,
       };
     } finally {
